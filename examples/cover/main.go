@@ -55,31 +55,37 @@ func main() {
 		X: margin + 40, Y: h - margin - 100, Width: w - 2*(margin+40), Align: pdfkit.AlignCenter,
 	})
 
-	// Title
+	// Title (explicit lines to keep vertical rhythm predictable)
 	doc.FillColor(ink).FontSize(26)
-	doc.Text("A Formal Framework for Pure-Go\nPDF Generation and Document Assembly", pdfkit.TextOptions{
-		X: margin + 48, Y: h - margin - 160, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter, LineGap: 8,
+	doc.Text("A Formal Framework for Pure-Go", pdfkit.TextOptions{
+		X: margin + 48, Y: h - margin - 155, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter,
+	})
+	doc.Text("PDF Generation and Document Assembly", pdfkit.TextOptions{
+		X: margin + 48, Y: h - margin - 188, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter,
 	})
 
 	// Subtitle
 	doc.FillColor(muted).FontSize(12)
-	doc.Text("Toward a canvas-oriented API with embeddable fonts, vector graphics,\nand lossless merge of existing PDF structures", pdfkit.TextOptions{
-		X: margin + 56, Y: h - margin - 260, Width: w - 2*(margin+56), Align: pdfkit.AlignCenter, LineGap: 4,
+	doc.Text("Toward a canvas-oriented API with embeddable fonts, vector graphics,", pdfkit.TextOptions{
+		X: margin + 56, Y: h - margin - 240, Width: w - 2*(margin+56), Align: pdfkit.AlignCenter,
+	})
+	doc.Text("and lossless merge of existing PDF structures", pdfkit.TextOptions{
+		X: margin + 56, Y: h - margin - 256, Width: w - 2*(margin+56), Align: pdfkit.AlignCenter,
 	})
 
 	// Decorative short rules
 	cx := w / 2
 	doc.StrokeColor(accent).LineWidth(1)
-	doc.MoveTo(cx-36, h/2+40).LineTo(cx+36, h/2+40).Stroke()
+	doc.MoveTo(cx-36, h/2+28).LineTo(cx+36, h/2+28).Stroke()
 
 	// Authors
 	doc.FillColor(ink).FontSize(13)
 	doc.Text("Suppachai Thanrukprasert", pdfkit.TextOptions{
-		X: margin + 48, Y: h/2 + 10, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter,
+		X: margin + 48, Y: h/2 - 2, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter,
 	})
 	doc.FillColor(muted).FontSize(10)
 	doc.Text("Department of Software Systems  ·  Independent Research", pdfkit.TextOptions{
-		X: margin + 48, Y: h/2 - 12, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter,
+		X: margin + 48, Y: h/2 - 24, Width: w - 2*(margin+48), Align: pdfkit.AlignCenter,
 	})
 
 	// Abstract box with rounded corners
