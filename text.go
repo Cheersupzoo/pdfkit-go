@@ -130,16 +130,21 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		p.write("BT /%s %.5f Tf %.5f %.5f Td (%s) Tj ET\n", fr.name, d.fontSize, x, y, escapePDFString(toWinAnsi(line)))
 		return
 	}
-	// Identity-H: write UTF-16BE glyph IDs as hex string using subset map built at embed time —
-	// At draw time we emit original glyph IDs; subset remaps at embed. Use two-byte CIDs matching
-	// pre-subset glyph IDs, then CIDToGIDMap Identity on subset font where glyph order == subset order.
-	// We remapped subset so newGID index order matches used glyphs sorted — so we must emit new GIDs.
-	// Track draw-time mapping: we'll emit using current glyphFor and remap in content at save...
-	// Simpler approach: don't subset-reorder in content; embed without remapping content by
-	// using Identity and full font OR encode with post-subset IDs stored in runeGlyph after subset.
-	// Practical approach for MVP: update runeGlyph after deciding subset order at first text, using
-	// provisional IDs; at embed time Subset preserves order of glyphIDs slice so new index == position.
-	p.write("BT /%s %.5f Tf %.5f %.5f Td <%s> Tj ET\n", fr.name, d.fontSize, x, y, encodeCIDHex(line, fr))
+	glyphs := fr.shape(line, d.fontSize)
+	if len(glyphs) == 0 {
+		return
+	}
+	// DW=0 fonts: Tj does not advance; we place each glyph with Td using shaped advances/offsets.
+	p.write("BT /%s %.5f Tf %.5f %.5f Td\n", fr.name, d.fontSize, x, y)
+	for _, g := range glyphs {
+		if g.XOffset != 0 || g.YOffset != 0 {
+			p.write("%.5f %.5f Td <%04X> Tj %.5f %.5f Td\n",
+				g.XOffset, g.YOffset, g.SubsetID, g.XAdvance-g.XOffset, -g.YOffset)
+			continue
+		}
+		p.write("<%04X> Tj %.5f 0 Td\n", g.SubsetID, g.XAdvance)
+	}
+	p.write("ET\n")
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {
@@ -163,26 +168,17 @@ func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, 
 
 func encodeCIDHex(s string, fr *fontResource) string {
 	var b strings.Builder
-	for _, r := range s {
-		if r == 0x00AD {
-			r = '-'
-		}
-		// glyphFor returns subset-local IDs when subsetting is enabled
-		g := fr.glyphFor(r)
-		fmt.Fprintf(&b, "%04X", g)
+	for _, g := range fr.shape(s, 12) {
+		fmt.Fprintf(&b, "%04X", g.SubsetID)
 	}
 	return b.String()
 }
 
 func measureText(s string, fr *fontResource, size float64) float64 {
-	w := 0.0
-	for _, r := range s {
-		if r == 0x00AD {
-			continue // soft hyphen not visible unless break
-		}
-		w += fr.advance(r, size)
+	if fr.standard {
+		return measureTextStandard(s, fr, size)
 	}
-	return w
+	return fr.measureShaped(s, size)
 }
 
 func wrapText(s string, fr *fontResource, size, maxW float64, softHyphen bool) []string {

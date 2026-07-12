@@ -2,7 +2,7 @@
 
 Pure Go library for creating and manipulating PDFs, inspired by [PDFKit](https://github.com/foliojs/pdfkit) and [pdf-lib](https://github.com/Hopding/pdf-lib).
 
-**Policy:** pure Go only (dependencies allowed, no CGO). Font parsing/subsetting uses [`tdewolff/font`](https://github.com/tdewolff/font) (includes WOFF/WOFF2 via Brotli).
+**Policy:** pure Go only (dependencies allowed, no CGO). Font parsing/subsetting uses [`tdewolff/font`](https://github.com/tdewolff/font); OpenType shaping (Thai/Arabic/Indic mark positioning, GSUB/GPOS) uses [`boxesandglue/textshape`](https://github.com/boxesandglue/textshape).
 
 ## Features
 

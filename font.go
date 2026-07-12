@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/boxesandglue/textshape/ot"
 	fontlib "github.com/tdewolff/font"
 
 	"github.com/Cheersupzoo/pdfkit-go/internal/pdf"
@@ -22,6 +23,9 @@ type fontResource struct {
 	subset      bool
 	subsetIndex map[uint16]uint16 // original glyph -> subset glyph id
 	subsetOrder []uint16          // subset glyph id -> original
+	shapeFont   *ot.Font
+	shaper      *ot.Shaper
+	upem        float64
 }
 
 var standardFonts = map[string]bool{
@@ -201,9 +205,13 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 	sfnt := fr.sfnt
 	glyphMap := map[uint16]uint16{} // old -> new
 	if fr.subset {
-		sub, err := fr.sfnt.Subset(glyphs, fontlib.SubsetOptions{Tables: fontlib.KeepPDFTables})
+		sub, err := fr.sfnt.Subset(glyphs, fontlib.SubsetOptions{Tables: fontlib.KeepMinTables})
 		if err != nil {
-			return pdf.Ref{}, err
+			// Fallback: embed without subsetting if subsetter fails for this face.
+			sub, err = fr.sfnt.Subset(glyphs, fontlib.SubsetOptions{Tables: fontlib.KeepAllTables})
+			if err != nil {
+				return pdf.Ref{}, err
+			}
 		}
 		sfnt = sub
 		for i, g := range glyphs {
@@ -260,21 +268,15 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 	}
 	descRef := cat.Add(descriptor)
 
-	// CID widths
-	wArray := pdf.Array{}
-	for newGID := 0; newGID < len(glyphs); newGID++ {
-		adv := float64(sfnt.GlyphAdvance(uint16(newGID))) * scale
-		wArray = append(wArray, pdf.Number(newGID), pdf.Array{pdf.Number(adv)})
-	}
-
+	// Widths are applied in the content stream via Td after OpenType shaping
+	// (needed for complex scripts). Keep DW=0 so Tj does not double-advance.
 	cidFont := pdf.Dict{
 		"Type":           pdf.Name("Font"),
 		"Subtype":        pdf.Name("CIDFontType2"),
 		"BaseFont":       pdf.Name(psName),
 		"CIDSystemInfo":  pdf.Dict{"Registry": pdf.String("Adobe"), "Ordering": pdf.String("Identity"), "Supplement": pdf.Number(0)},
 		"FontDescriptor": descRef,
-		"DW":             pdf.Number(1000),
-		"W":              wArray,
+		"DW":             pdf.Number(0),
 		"CIDToGIDMap":    pdf.Name("Identity"),
 	}
 	cidRef := cat.Add(cidFont)

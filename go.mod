@@ -2,7 +2,10 @@ module github.com/Cheersupzoo/pdfkit-go
 
 go 1.25.0
 
-require github.com/tdewolff/font v0.0.0-20260527091451-1663e68cb8a4
+require (
+	github.com/boxesandglue/textshape v0.0.13
+	github.com/tdewolff/font v0.0.0-20260527091451-1663e68cb8a4
+)
 
 require (
 	github.com/andybalholm/brotli v1.2.1 // indirect
