@@ -1,6 +1,8 @@
 # pdfkit-go — Research, Concerns, and Plan
 
-Inspiration: [PDFKit](https://github.com/foliojs/pdfkit) (generation + canvas-like API) and [pdf-lib](https://github.com/Hopding/pdf-lib) (create **and** modify existing PDFs). Goal: a pure Go library using the standard library as much as possible.
+Inspiration: [PDFKit](https://github.com/foliojs/pdfkit) (generation + canvas-like API) and [pdf-lib](https://github.com/Hopding/pdf-lib) (create **and** modify existing PDFs).
+
+**Dependency policy (confirmed):** pure Go dependencies are allowed; **no CGO**. Prefer stdlib when it is enough; use mature pure-Go packages for fonts/WOFF2 and other non-trivial formats.
 
 Repo currently: empty scaffold (`README.md` only).
 
@@ -17,34 +19,63 @@ pdf-lib’s stated motivation: most JS PDF libs can only *create*; few robustly 
 
 ---
 
+## Dependency policy
+
+### Rules
+
+- **Allowed:** pure Go modules (no `import "C"`, no system shared libs).
+- **Disallowed:** CGO wrappers (HarfBuzz via C, FreeType C bindings, libcairo, etc.).
+- **Prefer:** stdlib first (`image/jpeg`, `image/png`, `compress/zlib`, `crypto`, …).
+- **Pin carefully:** few deps, MIT/BSD/Apache-friendly licenses, active maintenance.
+- **Optional / build tags:** advanced font formats may live behind optional imports so core generation stays lean.
+
+### Recommended pure-Go building blocks
+
+| Need | Candidate | Role |
+| --- | --- | --- |
+| WOFF2 / Brotli | [`andybalholm/brotli`](https://github.com/andybalholm/brotli) | Decode WOFF2 payload (and any future Brotli streams) |
+| SFNT fonts + subset | [`tdewolff/font`](https://github.com/tdewolff/font) | Parse/write TTF/OTF/WOFF/WOFF2, subset, merge; already depends on brotli |
+| Low-level SFNT metrics | [`golang.org/x/image/font/sfnt`](https://pkg.go.dev/golang.org/x/image/font/sfnt) | Glyph index / advances if we want thinner coupling than a full font toolkit |
+| Unicode / BiDi (later) | [`golang.org/x/text`](https://pkg.go.dev/golang.org/x/text) | Segmentation, BiDi, optional when shaping expands |
+
+**Practical recommendation:** use `tdewolff/font` as the font front-end for Phase 4 (covers TTF/OTF/WOFF/WOFF2 + subsetting in one pure-Go stack). Keep PDF object embedding, ToUnicode, and CIDFont wiring in-repo — that is the library’s product surface, not something to outsource to a competing PDF generator.
+
+**Do not** depend on another full PDF library (gpdf, pdfcpu, unidoc, …) as the core; that would blur ownership of the object model and API.
+
+### Still in-house (even with deps)
+
+- PDF object model, content streams, xref reader/writer
+- Canvas / SVG path / gradients
+- Text layout (wrap, soft hyphen, align, lists)
+- Image → XObject mapping
+- Document modify/merge logic
+
+---
+
 ## Concerns (decide before coding)
 
-### 1. “Stdlib only” conflicts with the stated font matrix
+### 1. Font matrix — mostly unblocked under pure-Go deps
 
 The requested font list matches PDFKit/fontkit:
 
 - TrueType (`.ttf`), OpenType (`.otf`), WOFF, **WOFF2**, TTC, **dfont**
 - Font **subsetting**
 
-**Hard blockers for strict stdlib:**
+With pure-Go deps allowed, the former stdlib hard stop (**WOFF2/Brotli**) is gone.
 
-| Capability | Stdlib? | Notes |
-| --- | --- | --- |
-| TTF parse + embed + subset | No (must implement) | Large but well-specified; doable in pure Go |
-| OTF/CFF embed | No | Different PDF font objects (`CIDFontType0` vs `CIDFontType2`) |
-| WOFF | No | zlib per-table; zlib is stdlib — format parse is local code |
-| **WOFF2** | **No** | Needs **Brotli**; Brotli is **not** in Go stdlib |
-| TTC | No | Directory of SFNT faces — moderate |
-| **dfont** | No | Classic Mac resource-fork layout; niche, easy to defer |
-| Subsetting | No | Non-trivial table rewriting (`glyf`/`loca`, `cmap`, `hmtx`, CFF charstrings, etc.) |
+| Capability | Approach |
+| --- | --- |
+| TTF / OTF + subset | Prefer `tdewolff/font` (or implement atop `x/image/font/sfnt`) |
+| WOFF / WOFF2 | Covered by `tdewolff/font` + `andybalholm/brotli` |
+| TTC | Supported by several pure-Go font libs; wire face selection by name/index |
+| **dfont** | Still niche; likely custom or deferred — not a common pure-Go offering |
+| PDF embedding | Always our code: Type0 / CIDFontType0|2 / ToUnicode / FontDescriptor |
 
-**Recommendation (policy choice):**
+**Remaining font risks (not dependency-policy issues):**
 
-1. **Strict zero `go.mod` deps** → implement or vendor Brotli in-tree for WOFF2, *or* defer WOFF2 to a later phase.
-2. **“At most stdlib + one pure-Go dep”** → allow `andybalholm/brotli` (or equivalent) only for WOFF2.
-3. **Phase fonts**: TTF + subsetting first; OTF/CFF; WOFF; WOFF2; TTC; dfont last (or never).
-
-Without an explicit policy, “stdlib only” and “full PDFKit font parity” cannot both be true.
+- CFF vs TrueType embedding paths differ in PDF
+- Full OpenType shaping is still a separate engine (see concern 3)
+- dfont remains optional / last
 
 ### 2. Create vs modify/merge: asymmetric difficulty
 
@@ -79,7 +110,7 @@ Existing pure-Go options include generation-focused libs (e.g. gpdf) and create/
 
 - **PDFKit-like** imperative canvas API (`moveTo` / `lineTo` / `path` / `fill` / transforms / gradients)
 - **pdf-lib-like** load → mutate → save
-- Zero (or near-zero) deps, MIT, no CGO
+- Pure Go only (deps OK, no CGO), MIT
 
 Without that API story, this risks duplicating existing generators.
 
@@ -119,12 +150,15 @@ Recommend targeting **PDF 1.7** for generation (wide viewer support), with:
 
 ## Verdict
 
-**No show-stopper that kills the project**, but two decisions must be locked before implementation:
+**Pure-Go dependencies clear the main WOFF2/font-format blocker.** The project is ready to proceed under this policy.
 
-1. **Dependency policy** for WOFF2/Brotli (defer vs vendor vs allow one pure-Go dep).
-2. **Scope order**: generation-first MVP, then parse/merge, then deep edit — not all features in parallel.
+Remaining decisions before coding:
 
-With those accepted, proceed with the phased plan below.
+1. **Scope order**: generation-first MVP, then parse/merge, then deep edit — not all features in parallel.
+2. **dfont / full OT shaping**: in v1 or explicitly out?
+3. **Modify/merge** in first release, or generation-only MVP?
+
+Recommended default: generation MVP first; adopt `tdewolff/font` (+ transitive brotli) for Phase 4; defer dfont and advanced shaping.
 
 ---
 
@@ -174,7 +208,7 @@ _ = doc.Save(w)
 ### Phase 0 — Foundations (repo + contracts)
 
 - [ ] Module path, license (MIT recommended), Go version floor
-- [ ] Document dependency policy (stdlib / WOFF2 decision)
+- [ ] Codify dependency policy: pure Go only, no CGO; initial allowlist (`tdewolff/font`, `andybalholm/brotli`, optional `golang.org/x/...`)
 - [ ] Package layout + `Document` / `Page` / `Canvas` interfaces
 - [ ] Golden-test harness (write PDF bytes, optional visual later)
 - [ ] Coordinate system + units (points) documented
@@ -214,16 +248,14 @@ _ = doc.Save(w)
 
 ### Phase 4 — Font embedding + subsetting
 
-- [ ] TTF parse: `head`, `maxp`, `cmap`, `hhea`, `hmtx`, `loca`, `glyf`, `name`, `post`
-- [ ] Embed as PDF Type0 / CIDFontType2 / ToUnicode
-- [ ] Subset used glyphs; rewrite tables; identity or custom encoding
+- [ ] Integrate pure-Go font stack (`tdewolff/font` recommended) for load/subset of TTF/OTF/WOFF/WOFF2
+- [ ] Embed as PDF Type0 / CIDFontType2 / ToUnicode (TrueType path first)
+- [ ] Track used glyphs during text draw → subset at save
 - [ ] OTF/CFF path (CIDFontType0) — after TTF works
-- [ ] WOFF decode (zlib)
-- [ ] WOFF2 decode (per dependency policy)
 - [ ] TTC face selection by name/index
-- [ ] dfont — optional / last
+- [ ] dfont — optional / last (likely custom; low priority)
 
-**Exit criteria:** custom TTF subset embedded; file size clearly smaller than full font.
+**Exit criteria:** custom TTF (and at least one WOFF2) subset embedded; file size clearly smaller than full font.
 
 ### Phase 5 — Images
 
@@ -265,19 +297,19 @@ _ = doc.Save(w)
 
 ## Suggested MVP slice (first shippable)
 
-Ship **Phases 0–3 + JPEG/PNG basics + TTF embed (subset optional but preferred)** before investing in full modify/merge or WOFF2/dfont.
+Ship **Phases 0–3 + JPEG/PNG basics + TTF embed with subsetting** (via pure-Go font dep). Pull WOFF/WOFF2 in once TTF embedding is solid — no longer blocked by stdlib.
 
-That yields a usable PDFKit-like generator while keeping the door open for pdf-lib-style APIs in Phases 6–7.
+Defer full modify/merge and dfont until after that generator MVP.
 
 ---
 
 ## Open decisions (need owner confirmation)
 
-1. **WOFF2:** defer | vendor Brotli | allow one pure-Go dependency?
-2. **dfont / full OTF shaping:** in scope for v1 or explicitly out?
-3. **Modify/merge:** required for first release, or generation-only MVP?
-4. **Public API style:** PDFKit chainable methods vs pdf-lib `drawText` options structs (or both layers)?
-5. **Module / package name:** keep `pdfkit-go` or a neutral name to avoid trademark confusion with FolioJS PDFKit?
+1. **dfont / full OT shaping:** in scope for v1 or explicitly out?
+2. **Modify/merge:** required for first release, or generation-only MVP?
+3. **Public API style:** PDFKit chainable methods vs pdf-lib `drawText` options structs (or both layers)?
+4. **Module / package name:** keep `pdfkit-go` or a neutral name to avoid trademark confusion with FolioJS PDFKit?
+5. **Font stack choice:** adopt `tdewolff/font` as default, or thinner `x/image/font/sfnt` + custom subsetter?
 
 ---
 
@@ -287,4 +319,5 @@ That yields a usable PDFKit-like generator while keeping the door open for pdf-l
 - fontkit: https://github.com/foliojs/fontkit
 - pdf-lib motivation: create + modify in any JS environment — https://github.com/Hopding/pdf-lib
 - ISO 32000 PDF structure: xref, incremental updates, object streams
-- Go stdlib: `image/jpeg`, `image/png`, `compress/zlib`, `compress/flate` — no Brotli
+- Pure Go: [`andybalholm/brotli`](https://github.com/andybalholm/brotli), [`tdewolff/font`](https://github.com/tdewolff/font), [`golang.org/x/image/font/sfnt`](https://pkg.go.dev/golang.org/x/image/font/sfnt)
+- Go stdlib still used for images/compression: `image/jpeg`, `image/png`, `compress/zlib`
