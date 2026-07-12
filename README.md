@@ -1,42 +1,66 @@
 # pdfkit-go
 
-Pure Go library for creating and manipulating PDFs, inspired by [PDFKit](https://github.com/foliojs/pdfkit) and [pdf-lib](https://github.com/Hopding/pdf-lib).
+Pure Go PDF library inspired by [PDFKit](https://github.com/foliojs/pdfkit) and [pdf-lib](https://github.com/Hopding/pdf-lib).
 
-**Policy:** pure Go only (dependencies allowed, no CGO). Font parsing/subsetting uses [`tdewolff/font`](https://github.com/tdewolff/font); OpenType shaping (Thai/Arabic/Indic mark positioning, GSUB/GPOS) uses [`boxesandglue/textshape`](https://github.com/boxesandglue/textshape).
+No CGO. Dependencies are limited to pure-Go font tooling (`tdewolff/font`, `boxesandglue/textshape`).
 
 ## Features
 
-- Create new documents
-- Open, stamp, and merge existing PDFs
-- Vector graphics (canvas-like API, SVG path `d`, transforms, linear/radial gradients, opacity)
-- Text (wrapping with soft hyphens, alignments, bulleted lists)
-- Font embedding with subsetting (TTF/OTF/WOFF/WOFF2/TTC via `RegisterFont`)
-- Image embedding (JPEG pass-through, PNG including alpha)
+- Create documents; stream with `Save(io.Writer)` (HTTP-friendly)
+- Open, stamp, and merge existing unencrypted PDFs
+- Vector graphics: canvas API, SVG paths, transforms, gradients, opacity, rounded rects
+- Text: soft-hyphen wrapping, alignments, lists, Standard 14 fonts
+- Font embedding + subsetting (TTF/OTF/WOFF/WOFF2/TTC) with OpenType shaping
+- Images: JPEG pass-through, PNG (including alpha)
+
+## Install
+
+```bash
+go get github.com/Cheersupzoo/pdfkit-go
+```
 
 ## Quick start
 
 ```go
 package main
 
-import pdfkit "github.com/Cheersupzoo/pdfkit-go"
+import (
+	"log"
+	"net/http"
+
+	pdfkit "github.com/Cheersupzoo/pdfkit-go"
+)
 
 func main() {
-	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.Letter))
-	doc.AddPage()
-	doc.Font("Helvetica").FontSize(24)
-	doc.Text("Hello from pdfkit-go", pdfkit.TextOptions{X: 72, Y: 720})
-	doc.MoveTo(72, 680).LineTo(300, 680).Stroke()
-	_ = doc.WriteFile("hello.pdf")
+	http.HandleFunc("/pdf", func(w http.ResponseWriter, r *http.Request) {
+		doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+		doc.AddPage()
+		doc.Font("Helvetica").FontSize(24)
+		doc.Text("Hello from pdfkit-go", pdfkit.TextOptions{X: 72, Y: 750})
+		doc.MoveTo(72, 720).LineTo(300, 720).Stroke()
+
+		w.Header().Set("Content-Type", "application/pdf")
+		if err := doc.Save(w); err != nil {
+			http.Error(w, err.Error(), 500)
+		}
+	})
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 ```
 
-## Demo
+## Examples
 
 ```bash
+go test ./...
 go run ./examples/demo/
-# writes examples/demo/out/demo.pdf and merged.pdf
+go run ./examples/cover/
+go run ./examples/cover-th/   # Thai + TH Sarabun
 ```
 
-## Design notes
+## Design
 
-See [docs/RESEARCH_AND_PLAN.md](docs/RESEARCH_AND_PLAN.md).
+See [docs/DESIGN.md](docs/DESIGN.md).
+
+## License
+
+MIT
