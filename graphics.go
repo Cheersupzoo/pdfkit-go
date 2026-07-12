@@ -159,6 +159,31 @@ func (d *Document) Circle(x, y, r float64) *Document {
 	return d.ClosePath()
 }
 
+// RoundedRect appends a rectangle with corner radius r (clamped to half sides).
+func (d *Document) RoundedRect(x, y, w, h, r float64) *Document {
+	if r < 0 {
+		r = 0
+	}
+	if r > w/2 {
+		r = w / 2
+	}
+	if r > h/2 {
+		r = h / 2
+	}
+	k := 0.5522847498307936 * r
+	// start at bottom-left + r along bottom edge (PDF y-up)
+	d.MoveTo(x+r, y)
+	d.LineTo(x+w-r, y)
+	d.CurveTo(x+w-r+k, y, x+w, y+k, x+w, y+r)
+	d.LineTo(x+w, y+h-r)
+	d.CurveTo(x+w, y+h-r+k, x+w-r+k, y+h, x+w-r, y+h)
+	d.LineTo(x+r, y+h)
+	d.CurveTo(x+r-k, y+h, x, y+h-r+k, x, y+h-r)
+	d.LineTo(x, y+r)
+	d.CurveTo(x, y+r-k, x+r-k, y, x+r, y)
+	return d.ClosePath()
+}
+
 func (d *Document) Stroke() *Document {
 	d.Page().write("S\n")
 	d.Page().pathOpen = false
