@@ -37,6 +37,9 @@ func Open(r io.Reader) (*Document, error) {
 		p.setDefaults()
 		d.pages = append(d.pages, p)
 	}
+	if len(d.pages) > 0 {
+		d.currentPage = 0
+	}
 	return d, nil
 }
 
@@ -90,6 +93,9 @@ func (d *Document) Merge(other *Document) error {
 			}
 			d.pages = append(d.pages, p)
 		}
+		if len(d.pages) > 0 && d.currentPage < 0 {
+			d.currentPage = 0
+		}
 		return nil
 	}
 	// merge generated pages by copying content buffers
@@ -121,6 +127,9 @@ func (d *Document) Merge(other *Document) error {
 			}
 		}
 		d.pages = append(d.pages, p)
+	}
+	if len(d.pages) > 0 && d.currentPage < 0 {
+		d.currentPage = 0
 	}
 	return nil
 }
