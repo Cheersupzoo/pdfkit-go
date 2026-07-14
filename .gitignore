@@ -1,0 +1,6 @@
+examples/demo/out/
+artifacts/
+*.pdf
+!testdata/**
+.DS_Store
+testdata/*.pdf
