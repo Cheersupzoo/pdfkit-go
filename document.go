@@ -28,6 +28,7 @@ type Info struct {
 // Document is a PDF being created or modified.
 type Document struct {
 	pages          []*Page
+	currentPage    int // index of page targeted by draw APIs; -1 means none
 	fonts          map[string]*fontResource
 	images         map[string]*imageResource
 	patterns       map[string]*patternResource
@@ -55,6 +56,8 @@ type margins struct {
 // New creates an empty document.
 func New(opts ...Option) *Document {
 	d := &Document{
+		pages:      nil,
+		currentPage: -1,
 		fonts:      map[string]*fontResource{},
 		images:     map[string]*imageResource{},
 		patterns:   map[string]*patternResource{},
@@ -114,6 +117,7 @@ func (d *Document) AddPage(size ...PageSize) *Page {
 	p.content.WriteString("q\n")
 	p.setDefaults()
 	d.pages = append(d.pages, p)
+	d.currentPage = len(d.pages) - 1
 	d.textX = d.margins.Left
 	d.textY = s.Height - d.margins.Top - d.fontSize
 	return p
@@ -124,15 +128,19 @@ func (d *Document) Page() *Page {
 	if len(d.pages) == 0 {
 		return d.AddPage()
 	}
-	return d.pages[len(d.pages)-1]
+	if d.currentPage < 0 || d.currentPage >= len(d.pages) {
+		d.currentPage = len(d.pages) - 1
+	}
+	return d.pages[d.currentPage]
 }
 
-// SwitchToPage selects a page by 0-based index.
+// SwitchToPage selects a page by 0-based index and makes it current for subsequent draws.
 func (d *Document) SwitchToPage(i int) *Page {
 	if i < 0 || i >= len(d.pages) {
 		d.err = fmt.Errorf("pdfkit: page index %d out of range", i)
 		return d.Page()
 	}
+	d.currentPage = i
 	return d.pages[i]
 }
 
