@@ -365,10 +365,7 @@ func (d *Document) saveWithImports(w io.Writer) error {
 		}
 
 		if len(page.usedFonts) > 0 {
-			fd, _ := resources["Font"].(pdf.Dict)
-			if fd == nil {
-				fd = pdf.Dict{}
-			}
+			fd := resourceSubDict(resources, "Font", cat)
 			for fn := range page.usedFonts {
 				if r, ok := fontRefs[fn]; ok {
 					fd[pdf.Name(fn)] = r
@@ -377,10 +374,7 @@ func (d *Document) saveWithImports(w io.Writer) error {
 			resources["Font"] = fd
 		}
 		if len(page.usedImages) > 0 {
-			xd, _ := resources["XObject"].(pdf.Dict)
-			if xd == nil {
-				xd = pdf.Dict{}
-			}
+			xd := resourceSubDict(resources, "XObject", cat)
 			for in := range page.usedImages {
 				if r, ok := imageRefs[in]; ok {
 					xd[pdf.Name(in)] = r
@@ -389,7 +383,7 @@ func (d *Document) saveWithImports(w io.Writer) error {
 			resources["XObject"] = xd
 		}
 		if len(page.usedShadings) > 0 {
-			sd := pdf.Dict{}
+			sd := resourceSubDict(resources, "Shading", cat)
 			for sn := range page.usedShadings {
 				if r, ok := shadingRefs[sn]; ok {
 					sd[pdf.Name(sn)] = r
@@ -398,7 +392,7 @@ func (d *Document) saveWithImports(w io.Writer) error {
 			resources["Shading"] = sd
 		}
 		if len(page.usedExtG) > 0 {
-			ed := pdf.Dict{}
+			ed := resourceSubDict(resources, "ExtGState", cat)
 			for en := range page.usedExtG {
 				if r, ok := extRefs[en]; ok {
 					ed[pdf.Name(en)] = r
@@ -465,6 +459,29 @@ func mergeResources(a, b pdf.Dict) pdf.Dict {
 			}
 		}
 		out[k] = v
+	}
+	return out
+}
+
+// resourceSubDict returns a mutable copy of a resource category dict (Font, XObject, …).
+// Imported pages often keep these as Refs into importCat; a plain type assert to Dict
+// fails and would drop original assets when stamping overlay fonts/images.
+func resourceSubDict(resources pdf.Dict, key pdf.Name, cat *pdf.Catalog) pdf.Dict {
+	out := pdf.Dict{}
+	obj := resources[key]
+	switch v := obj.(type) {
+	case pdf.Dict:
+		for k, val := range v {
+			out[k] = val
+		}
+	case pdf.Ref:
+		if cat != nil {
+			if d, ok := cat.Get(v.ID).(pdf.Dict); ok {
+				for k, val := range d {
+					out[k] = val
+				}
+			}
+		}
 	}
 	return out
 }

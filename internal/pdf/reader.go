@@ -357,6 +357,12 @@ func (d *DocumentModel) parseIndirectAtOffset(offset int) (Object, int, error) {
 		if err == nil {
 			return obj, id, nil
 		}
+		if !errors.Is(err, errTruncatedStream) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			// Keep expanding on truncated streams; other errors may still be from a short buffer.
+			if int64(end) >= d.size {
+				return nil, 0, err
+			}
+		}
 		if int64(end) >= d.size {
 			return nil, 0, err
 		}
@@ -367,45 +373,129 @@ func (d *DocumentModel) parseIndirectAtOffset(offset int) (Object, int, error) {
 	}
 }
 
-func (d *DocumentModel) ensureSortedOffsets() {
-	if d.sortedOff != nil {
-		return
-	}
-	offs := make([]int, 0, len(d.xref))
-	for _, e := range d.xref {
-		if e.typ == 1 {
-			offs = append(offs, e.offset)
+// streamLength resolves /Length to a concrete byte count when possible.
+func (d *DocumentModel) streamLength(dict Dict) (int, bool, error) {
+	switch v := dict["Length"].(type) {
+	case Number:
+		n := int(v)
+		if n < 0 {
+			return 0, false, errors.New("pdf: negative stream Length")
 		}
-	}
-	// insertion sort is fine for typical sizes; use simple sort
-	for i := 1; i < len(offs); i++ {
-		v := offs[i]
-		j := i
-		for j > 0 && offs[j-1] > v {
-			offs[j] = offs[j-1]
-			j--
+		return n, true, nil
+	case Ref:
+		obj, err := d.Get(v.ID)
+		if err != nil {
+			return 0, false, err
 		}
-		offs[j] = v
+		n, ok := obj.(Number)
+		if !ok {
+			return 0, false, fmt.Errorf("pdf: stream Length ref %d is %T, not number", v.ID, obj)
+		}
+		if int(n) < 0 {
+			return 0, false, errors.New("pdf: negative stream Length")
+		}
+		return int(n), true, nil
+	default:
+		return 0, false, nil
 	}
-	d.sortedOff = offs
 }
 
-func (d *DocumentModel) objectEnd(start int) int {
-	d.ensureSortedOffsets()
-	// first offset strictly greater than start
-	lo, hi := 0, len(d.sortedOff)
-	for lo < hi {
-		mid := (lo + hi) / 2
-		if d.sortedOff[mid] <= start {
-			lo = mid + 1
-		} else {
-			hi = mid
+// ensureStreamComplete re-reads stream bytes using a resolved /Length so FontFile2
+// and other binary streams are not truncated by endstream false-matches.
+func (d *DocumentModel) ensureStreamComplete(objOffset int, st Stream) (Stream, error) {
+	_, lengthWasRef := st.Dict["Length"].(Ref)
+	length, ok, err := d.streamLength(st.Dict)
+	if err != nil {
+		return st, err
+	}
+	if !ok {
+		return st, nil
+	}
+	st.Dict["Length"] = Number(length)
+	// Always re-read when Length was indirect: the initial parse may have scanned for
+	// "endstream" inside binary font/image data and truncated incorrectly.
+	if !lengthWasRef && len(st.Data) == length {
+		return st, nil
+	}
+	return d.rereadStreamExact(objOffset, st.Dict, length)
+}
+
+func (d *DocumentModel) rereadStreamExact(objOffset int, dict Dict, length int) (Stream, error) {
+	// Copy dict and force direct Length so parseStreamAfterDict takes the exact path.
+	nd := Dict{}
+	for k, v := range dict {
+		nd[k] = v
+	}
+	nd["Length"] = Number(length)
+
+	chunk := length + 64<<10
+	if chunk < 64<<10 {
+		chunk = 64 << 10
+	}
+	for {
+		end := objOffset + chunk
+		if int64(end) > d.size {
+			end = int(d.size)
 		}
+		data, err := d.readRange(objOffset, end-objOffset)
+		if err != nil && len(data) == 0 {
+			return Stream{}, err
+		}
+		// Locate the stream keyword after the object header/dict.
+		streamAt := findStreamKeyword(data)
+		if streamAt < 0 {
+			if int64(end) >= d.size {
+				return Stream{}, errors.New("pdf: missing stream keyword")
+			}
+			chunk *= 2
+			continue
+		}
+		p := streamAt
+		obj, err := parseStreamAfterDict(data, &p, nd)
+		if errors.Is(err, errTruncatedStream) {
+			if int64(end) >= d.size {
+				return Stream{}, fmt.Errorf("pdf: stream Length %d exceeds file", length)
+			}
+			chunk *= 2
+			continue
+		}
+		if err != nil {
+			return Stream{}, err
+		}
+		st := obj.(Stream)
+		st.Dict = nd
+		if len(st.Data) != length {
+			return Stream{}, fmt.Errorf("pdf: stream data length %d != /Length %d", len(st.Data), length)
+		}
+		return st, nil
 	}
-	if lo < len(d.sortedOff) {
-		return d.sortedOff[lo]
+}
+
+func findStreamKeyword(data []byte) int {
+	// Match "stream" as a keyword (not inside names/strings best-effort via dict parse path).
+	// Objects look like: N G obj << ... >> stream
+	idx := 0
+	for {
+		i := bytes.Index(data[idx:], []byte("stream"))
+		if i < 0 {
+			return -1
+		}
+		i += idx
+		// Previous non-space should be '>' from '>>' or whitespace after dict.
+		j := i - 1
+		for j >= 0 && (data[j] == ' ' || data[j] == '\t' || data[j] == '\r' || data[j] == '\n') {
+			j--
+		}
+		if j >= 0 && data[j] == '>' {
+			// Ensure not "endstream"
+			if i >= 3 && bytes.Equal(data[i-3:i], []byte("end")) {
+				idx = i + 6
+				continue
+			}
+			return i
+		}
+		idx = i + 6
 	}
-	return int(d.size)
 }
 
 // Get loads object id on demand (cached).
@@ -425,7 +515,6 @@ func (d *DocumentModel) Get(id int) (Object, error) {
 		return nil, nil
 	case 1:
 		end := d.objectEnd(ent.offset)
-		// Include a little slack before next object; streams may need it when Length is indirect.
 		length := end - ent.offset
 		if length < 256 {
 			length = 256
@@ -439,11 +528,17 @@ func (d *DocumentModel) Get(id int) (Object, error) {
 		}
 		obj, _, err := parseIndirectAt(data, 0)
 		if err != nil {
-			// Retry with a larger window up to EOF (Length-as-ref / unusual packing).
 			obj, _, err = d.parseIndirectAtOffset(ent.offset)
 			if err != nil {
 				return nil, fmt.Errorf("pdf: object %d at %d: %w", id, ent.offset, err)
 			}
+		}
+		if st, ok := obj.(Stream); ok {
+			st, err = d.ensureStreamComplete(ent.offset, st)
+			if err != nil {
+				return nil, fmt.Errorf("pdf: object %d stream: %w", id, err)
+			}
+			obj = st
 		}
 		d.cache[id] = obj
 		return obj, nil
@@ -461,6 +556,45 @@ func (d *DocumentModel) Get(id int) (Object, error) {
 	default:
 		return nil, fmt.Errorf("pdf: bad xref type %d for object %d", ent.typ, id)
 	}
+}
+
+func (d *DocumentModel) ensureSortedOffsets() {
+	if d.sortedOff != nil {
+		return
+	}
+	offs := make([]int, 0, len(d.xref))
+	for _, e := range d.xref {
+		if e.typ == 1 {
+			offs = append(offs, e.offset)
+		}
+	}
+	for i := 1; i < len(offs); i++ {
+		v := offs[i]
+		j := i
+		for j > 0 && offs[j-1] > v {
+			offs[j] = offs[j-1]
+			j--
+		}
+		offs[j] = v
+	}
+	d.sortedOff = offs
+}
+
+func (d *DocumentModel) objectEnd(start int) int {
+	d.ensureSortedOffsets()
+	lo, hi := 0, len(d.sortedOff)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if d.sortedOff[mid] <= start {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	if lo < len(d.sortedOff) {
+		return d.sortedOff[lo]
+	}
+	return int(d.size)
 }
 
 func (d *DocumentModel) loadObjStream(streamID int) ([]Object, error) {
@@ -791,6 +925,8 @@ func parseDict(data []byte, p *int) (Object, error) {
 	}
 }
 
+var errTruncatedStream = errors.New("pdf: truncated stream data")
+
 func parseStreamAfterDict(data []byte, p *int, d Dict) (Object, error) {
 	*p += len("stream")
 	if *p < len(data) && data[*p] == '\r' {
@@ -799,17 +935,27 @@ func parseStreamAfterDict(data []byte, p *int, d Dict) (Object, error) {
 	if *p < len(data) && data[*p] == '\n' {
 		*p++
 	}
-	length := 0
+	length := -1
+	hasLength := false
 	if n, ok := d["Length"].(Number); ok {
 		length = int(n)
-	} else if ref, ok := d["Length"].(Ref); ok {
-		// Length as indirect — best effort scan until endstream
-		_ = ref
+		hasLength = true
+	} else if _, ok := d["Length"].(Ref); ok {
+		// Indirect Length cannot be resolved from this buffer alone.
+		// Prefer expanding the read (errTruncatedStream) over scanning for
+		// "endstream", which can false-match inside binary FontFile data.
+		hasLength = false
 		length = -1
 	}
 	start := *p
 	var raw []byte
-	if length >= 0 && start+length <= len(data) {
+	if hasLength {
+		if length < 0 {
+			return nil, errors.New("pdf: negative stream Length")
+		}
+		if start+length > len(data) {
+			return nil, errTruncatedStream
+		}
 		raw = data[start : start+length]
 		*p = start + length
 		skipWSBuf(data, p)
@@ -817,9 +963,11 @@ func parseStreamAfterDict(data []byte, p *int, d Dict) (Object, error) {
 			*p += len("endstream")
 		}
 	} else {
+		// Unknown length (missing or indirect): scan for endstream only as last resort.
 		idx := bytes.Index(data[start:], []byte("endstream"))
 		if idx < 0 {
-			return nil, errors.New("pdf: missing endstream")
+			// Likely truncated buffer while Length is still a Ref — ask caller to expand.
+			return nil, errTruncatedStream
 		}
 		raw = bytes.TrimRight(data[start:start+idx], "\r\n")
 		*p = start + idx + len("endstream")
