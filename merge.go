@@ -9,21 +9,48 @@ import (
 )
 
 // Open reads an existing PDF for modification / page copying.
+// Non-seekable readers are spooled to a temp file. Objects are loaded lazily
+// from the file until pages are materialized (Merge or Save).
 func Open(r io.Reader) (*Document, error) {
 	model, err := pdf.Open(r)
 	if err != nil {
 		return nil, err
 	}
+	return documentFromModel(model)
+}
+
+// OpenFile opens a PDF from disk without copying it into memory up front.
+// The file remains open until Document.Close or after pages are materialized and the source is released.
+func OpenFile(path string) (*Document, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	model, err := pdf.OpenReaderAt(f, st.Size(), f)
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return documentFromModel(model)
+}
+
+func documentFromModel(model *pdf.DocumentModel) (*Document, error) {
 	d := New()
 	d.imported = model
 	refs, err := model.PageRefs()
 	if err != nil {
+		_ = model.Close()
 		return nil, err
 	}
-	d.importedPages = refs
 	for _, ref := range refs {
 		pd, err := model.GetPageDict(ref)
 		if err != nil {
+			_ = model.Close()
 			return nil, err
 		}
 		w, h := pageSizeFromDict(pd)
@@ -43,62 +70,38 @@ func Open(r io.Reader) (*Document, error) {
 	return d, nil
 }
 
-// OpenFile opens a PDF from disk.
-func OpenFile(path string) (*Document, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return Open(f)
-}
-
+// importedPage is either a lazy reference into a source DocumentModel,
+// or materialized content/resources owned by Document.importCat.
 type importedPage struct {
 	src *pdf.DocumentModel
 	ref pdf.Ref
+
+	contents  pdf.Object // Ref or Array of Refs into importCat
+	resources pdf.Dict
+}
+
+func (ip *importedPage) isMaterialized() bool {
+	return ip != nil && ip.src == nil && (ip.contents != nil || ip.resources != nil)
+}
+
+func (d *Document) ensureImportCat() *pdf.Catalog {
+	if d.importCat == nil {
+		d.importCat = pdf.NewCatalog()
+	}
+	return d.importCat
 }
 
 // Merge appends all pages from other into d.
+// Imported pages are materialized into d (cloned into d.importCat) so other can be Closed
+// and its source file released without keeping all merge inputs in memory.
 func (d *Document) Merge(other *Document) error {
-	if other.imported != nil && len(other.importedPages) > 0 {
-		for i, ref := range other.importedPages {
-			pd, err := other.imported.GetPageDict(ref)
-			if err != nil {
-				return err
-			}
-			w, h := pageSizeFromDict(pd)
-			p := &Page{
-				doc:      d,
-				width:    w,
-				height:   h,
-				margin:   d.margins,
-				imported: &importedPage{src: other.imported, ref: ref},
-			}
-			p.setDefaults()
-			// also carry overlay content from other's page if any
-			if i < len(other.pages) && other.pages[i].content.Len() > 0 {
-				p.content.Write(other.pages[i].content.Bytes())
-				for k := range other.pages[i].usedFonts {
-					p.usedFonts[k] = true
-					if fr, ok := other.fonts[k]; ok {
-						d.fonts[k] = fr
-					}
-				}
-				for k := range other.pages[i].usedImages {
-					p.usedImages[k] = true
-					if ir, ok := other.images[k]; ok {
-						d.images[k] = ir
-					}
-				}
-			}
-			d.pages = append(d.pages, p)
-		}
-		if len(d.pages) > 0 && d.currentPage < 0 {
-			d.currentPage = 0
-		}
+	if other == nil {
 		return nil
 	}
-	// merge generated pages by copying content buffers
+	cat := d.ensureImportCat()
+	seenBySrc := map[*pdf.DocumentModel]map[int]pdf.Ref{}
+	var remapSeen map[int]pdf.Ref
+
 	for _, op := range other.pages {
 		p := &Page{
 			doc:    d,
@@ -107,23 +110,50 @@ func (d *Document) Merge(other *Document) error {
 			margin: op.margin,
 		}
 		p.setDefaults()
-		p.content.Write(op.content.Bytes())
-		for k := range op.usedFonts {
-			p.usedFonts[k] = true
-			if fr, ok := other.fonts[k]; ok {
-				d.fonts[k] = fr
+		if op.content.Len() > 0 {
+			p.content.Write(op.content.Bytes())
+			for k := range op.usedFonts {
+				p.usedFonts[k] = true
+				if fr, ok := other.fonts[k]; ok {
+					d.fonts[k] = fr
+				}
+			}
+			for k := range op.usedImages {
+				p.usedImages[k] = true
+				if ir, ok := other.images[k]; ok {
+					d.images[k] = ir
+				}
+			}
+			for k := range op.usedShadings {
+				p.usedShadings[k] = true
+				if sh, ok := other.shadings[k]; ok {
+					d.shadings[k] = sh
+				}
 			}
 		}
-		for k := range op.usedImages {
-			p.usedImages[k] = true
-			if ir, ok := other.images[k]; ok {
-				d.images[k] = ir
-			}
-		}
-		for k := range op.usedShadings {
-			p.usedShadings[k] = true
-			if sh, ok := other.shadings[k]; ok {
-				d.shadings[k] = sh
+
+		if op.imported != nil {
+			switch {
+			case op.imported.src != nil:
+				seen := seenBySrc[op.imported.src]
+				if seen == nil {
+					seen = map[int]pdf.Ref{}
+					seenBySrc[op.imported.src] = seen
+				}
+				ip, err := materializeFromSrc(op.imported, cat, seen)
+				if err != nil {
+					return err
+				}
+				p.imported = ip
+			case op.imported.isMaterialized():
+				if remapSeen == nil {
+					remapSeen = map[int]pdf.Ref{}
+				}
+				ip, err := remapMaterialized(op.imported, other.importCat, cat, remapSeen)
+				if err != nil {
+					return err
+				}
+				p.imported = ip
 			}
 		}
 		d.pages = append(d.pages, p)
@@ -134,14 +164,17 @@ func (d *Document) Merge(other *Document) error {
 	return nil
 }
 
-// MergeFiles opens and merges PDF files into d.
+// MergeFiles opens and merges PDF files into d one at a time, releasing each
+// source after its pages are materialized into d.
 func (d *Document) MergeFiles(paths ...string) error {
 	for _, path := range paths {
 		other, err := OpenFile(path)
 		if err != nil {
 			return err
 		}
-		if err := d.Merge(other); err != nil {
+		err = d.Merge(other)
+		_ = other.Close()
+		if err != nil {
 			return err
 		}
 	}
@@ -160,11 +193,99 @@ func pageSizeFromDict(pd pdf.Dict) (float64, float64) {
 	return Letter.Width, Letter.Height
 }
 
-// --- deep copy helpers for imported pages during Save ---
+func materializeFromSrc(srcIP *importedPage, cat *pdf.Catalog, seen map[int]pdf.Ref) (*importedPage, error) {
+	src := srcIP.src
+	srcPage, err := src.GetPageDict(srcIP.ref)
+	if err != nil {
+		return nil, err
+	}
+	var contentRefs pdf.Array
+	switch c := srcPage["Contents"].(type) {
+	case pdf.Ref, pdf.Stream:
+		contentRefs = append(contentRefs, cloneIntoCatalog(c, src, cat, seen))
+	case pdf.Array:
+		for _, item := range c {
+			contentRefs = append(contentRefs, cloneIntoCatalog(item, src, cat, seen))
+		}
+	default:
+		if resolved := src.Resolve(srcPage["Contents"]); resolved != nil {
+			contentRefs = append(contentRefs, cloneIntoCatalog(resolved, src, cat, seen))
+		}
+	}
+	var contents pdf.Object
+	switch len(contentRefs) {
+	case 0:
+		contents = nil
+	case 1:
+		contents = contentRefs[0]
+	default:
+		contents = contentRefs
+	}
+	resources := pdf.Dict{}
+	if res := src.Resolve(srcPage["Resources"]); res != nil {
+		if rd, ok := res.(pdf.Dict); ok {
+			resources = cloneObject(rd, src, cat, seen).(pdf.Dict)
+		}
+	}
+	return &importedPage{contents: contents, resources: resources}, nil
+}
+
+func remapMaterialized(srcIP *importedPage, srcCat, dstCat *pdf.Catalog, seen map[int]pdf.Ref) (*importedPage, error) {
+	if srcCat == nil {
+		return &importedPage{
+			contents:  srcIP.contents,
+			resources: srcIP.resources,
+		}, nil
+	}
+	var contents pdf.Object
+	if srcIP.contents != nil {
+		contents = remapObject(srcIP.contents, srcCat, dstCat, seen)
+	}
+	var resources pdf.Dict
+	if srcIP.resources != nil {
+		resources = remapObject(srcIP.resources, srcCat, dstCat, seen).(pdf.Dict)
+	}
+	return &importedPage{contents: contents, resources: resources}, nil
+}
+
+// materializeAllPending clones any still-lazy imported pages into importCat and closes sources.
+func (d *Document) materializeAllPending() error {
+	seenBySrc := map[*pdf.DocumentModel]map[int]pdf.Ref{}
+	cat := d.ensureImportCat()
+	for i, p := range d.pages {
+		if p.imported == nil || p.imported.src == nil {
+			continue
+		}
+		src := p.imported.src
+		seen := seenBySrc[src]
+		if seen == nil {
+			seen = map[int]pdf.Ref{}
+			seenBySrc[src] = seen
+		}
+		ip, err := materializeFromSrc(p.imported, cat, seen)
+		if err != nil {
+			return err
+		}
+		d.pages[i].imported = ip
+	}
+	for src := range seenBySrc {
+		_ = src.Close()
+	}
+	if d.imported != nil {
+		// Closed above if it had pages; still clear the handle.
+		d.imported = nil
+	}
+	return nil
+}
+
+// --- save path for imported / materialized pages ---
 
 func (d *Document) saveWithImports(w io.Writer) error {
-	// Fallback path invoked when any page is imported.
-	cat := pdf.NewCatalog()
+	if err := d.materializeAllPending(); err != nil {
+		return err
+	}
+	cat := d.ensureImportCat()
+
 	fontRefs := map[string]pdf.Ref{}
 	embeddedFonts := map[*fontResource]pdf.Ref{}
 	for name, fr := range d.fonts {
@@ -204,18 +325,6 @@ func (d *Document) saveWithImports(w io.Writer) error {
 		extRefs[name] = cat.Add(eg.dict)
 	}
 
-	// Deduplicate cloned indirect objects per source document across all pages.
-	// Object IDs are only unique within a single PDF, so the seen map is keyed by source.
-	seenBySrc := map[*pdf.DocumentModel]map[int]pdf.Ref{}
-	seenFor := func(src *pdf.DocumentModel) map[int]pdf.Ref {
-		if m, ok := seenBySrc[src]; ok {
-			return m
-		}
-		m := map[int]pdf.Ref{}
-		seenBySrc[src] = m
-		return m
-	}
-
 	var builtPages []pdf.Ref
 	for _, page := range d.pages {
 		var contentRefs pdf.Array
@@ -224,36 +333,23 @@ func (d *Document) saveWithImports(w io.Writer) error {
 		}
 
 		if page.imported != nil {
-			src := page.imported.src
-			seen := seenFor(src)
-			srcPage, err := src.GetPageDict(page.imported.ref)
-			if err != nil {
-				return err
-			}
-			// Copy original contents; pass Refs through cloneObject so shared streams dedupe.
-			switch c := srcPage["Contents"].(type) {
-			case pdf.Ref, pdf.Stream:
-				contentRefs = append(contentRefs, cloneIntoCatalog(c, src, cat, seen))
+			switch c := page.imported.contents.(type) {
+			case pdf.Ref:
+				contentRefs = append(contentRefs, c)
 			case pdf.Array:
-				for _, item := range c {
-					contentRefs = append(contentRefs, cloneIntoCatalog(item, src, cat, seen))
-				}
+				contentRefs = append(contentRefs, c...)
+			case nil:
+				// no content
 			default:
-				if resolved := src.Resolve(srcPage["Contents"]); resolved != nil {
-					contentRefs = append(contentRefs, cloneIntoCatalog(resolved, src, cat, seen))
-				}
+				contentRefs = append(contentRefs, cat.Add(c))
 			}
-			// Merge original resources (fonts/xobjects); nested Refs share seen across pages.
-			if res := src.Resolve(srcPage["Resources"]); res != nil {
-				if rd, ok := res.(pdf.Dict); ok {
-					resources = mergeResources(resources, cloneObject(rd, src, cat, seen).(pdf.Dict))
-				}
+			if page.imported.resources != nil {
+				resources = mergeResources(resources, page.imported.resources)
 			}
 		}
 
 		overlay := page.content.Bytes()
 		if len(overlay) > 0 {
-			// ensure graphics state balanced for overlay
 			data := overlay
 			if page.imported != nil {
 				data = append([]byte("q\n"), overlay...)
@@ -390,7 +486,6 @@ func cloneObject(obj pdf.Object, src *pdf.DocumentModel, cat *pdf.Catalog, seen 
 			return r
 		}
 		resolved := src.Resolve(o)
-		// reserve id
 		placeholder := cat.Add(pdf.Null{})
 		seen[o.ID] = placeholder
 		cloned := cloneObject(resolved, src, cat, seen)
@@ -420,6 +515,58 @@ func cloneObject(obj pdf.Object, src *pdf.DocumentModel, cat *pdf.Catalog, seen 
 	default:
 		return o
 	}
+}
+
+// remapObject copies objects from srcCat into dstCat with a shared seen map.
+func remapObject(obj pdf.Object, srcCat, dstCat *pdf.Catalog, seen map[int]pdf.Ref) pdf.Object {
+	switch o := obj.(type) {
+	case pdf.Ref:
+		if r, ok := seen[o.ID]; ok {
+			return r
+		}
+		placeholder := dstCat.Add(pdf.Null{})
+		seen[o.ID] = placeholder
+		raw := srcCat.Get(o.ID)
+		dstCat.Set(placeholder.ID, remapObject(raw, srcCat, dstCat, seen))
+		return placeholder
+	case pdf.Dict:
+		nd := pdf.Dict{}
+		for k, v := range o {
+			if k == "Parent" {
+				continue
+			}
+			nd[k] = remapObject(v, srcCat, dstCat, seen)
+		}
+		return nd
+	case pdf.Array:
+		na := make(pdf.Array, len(o))
+		for i, v := range o {
+			na[i] = remapObject(v, srcCat, dstCat, seen)
+		}
+		return na
+	case pdf.Stream:
+		nd := pdf.Dict{}
+		for k, v := range o.Dict {
+			nd[k] = remapObject(v, srcCat, dstCat, seen)
+		}
+		return pdf.Stream{Dict: nd, Data: append([]byte(nil), o.Data...)}
+	default:
+		return o
+	}
+}
+
+// HasLiveImportSource reports whether any page still references an open source model.
+// Intended for tests and diagnostics.
+func (d *Document) HasLiveImportSource() bool {
+	if d.imported != nil {
+		return true
+	}
+	for _, p := range d.pages {
+		if p.imported != nil && p.imported.src != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // helper used by tests

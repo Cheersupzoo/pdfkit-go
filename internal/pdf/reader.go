@@ -10,62 +10,145 @@ import (
 	"strings"
 )
 
-// DocumentModel is a parsed PDF suitable for page extraction / merge.
+// xrefEntry describes where an object lives in the file (lazy; not yet parsed).
+type xrefEntry struct {
+	typ        int // 0=free, 1=uncompressed, 2=compressed (objstm)
+	offset     int // typ1: file offset; typ2: object stream id
+	genOrIndex int // typ1: generation; typ2: index within object stream
+}
+
+// DocumentModel is a lazily-parsed PDF suitable for page extraction / merge.
+// Objects are loaded from ra on demand via Get/Resolve.
 type DocumentModel struct {
-	Objects map[int]Object // object number -> resolved object (may still contain Refs)
+	ra     io.ReaderAt
+	size   int64
+	closer io.Closer
+
+	xref  map[int]xrefEntry
+	cache map[int]Object
+
+	// objStmCache holds fully decoded object-stream contents keyed by stream object id.
+	objStmCache map[int][]Object
+
 	Root    Ref
 	Info    Ref
 	Trailer Dict
+
+	sortedOff []int // sorted typ1 offsets for object bounds; built lazily
 }
 
 // Open parses a PDF from r into a DocumentModel.
+// Non-seekable readers are spooled to a temporary file. The file is not fully
+// decoded up front — only the xref index is built; objects load on demand.
 func Open(r io.Reader) (*DocumentModel, error) {
-	data, err := io.ReadAll(r)
+	ra, size, closer, err := readerAtOf(r)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Contains(data[:min(1024, len(data))], []byte("%PDF-")) {
-		return nil, errors.New("pdf: not a PDF file")
+	return OpenReaderAt(ra, size, closer)
+}
+
+// Close releases any owned underlying reader (temp spool or owned file).
+func (d *DocumentModel) Close() error {
+	if d == nil || d.closer == nil {
+		return nil
 	}
-	startxref := bytes.LastIndex(data, []byte("startxref"))
-	if startxref < 0 {
-		return nil, errors.New("pdf: missing startxref")
+	err := d.closer.Close()
+	d.closer = nil
+	return err
+}
+
+func (d *DocumentModel) initFromReaderAt() error {
+	headLen := int64(1024)
+	if headLen > d.size {
+		headLen = d.size
 	}
-	rest := data[startxref+len("startxref"):]
+	head, err := d.readRange(0, int(headLen))
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(head, []byte("%PDF-")) {
+		return errors.New("pdf: not a PDF file")
+	}
+
+	tailLen := int64(8192)
+	if tailLen > d.size {
+		tailLen = d.size
+	}
+	tailOff := d.size - tailLen
+	tail, err := d.readRange(int(tailOff), int(tailLen))
+	if err != nil {
+		return err
+	}
+	idx := bytes.LastIndex(tail, []byte("startxref"))
+	if idx < 0 {
+		return errors.New("pdf: missing startxref")
+	}
+	rest := tail[idx+len("startxref"):]
 	rest = bytes.TrimLeft(rest, " \t\r\n")
 	lineEnd := bytes.IndexAny(rest, "\r\n")
 	if lineEnd < 0 {
-		return nil, errors.New("pdf: bad startxref")
+		return errors.New("pdf: bad startxref")
 	}
 	xrefOffset, err := strconv.Atoi(string(bytes.TrimSpace(rest[:lineEnd])))
 	if err != nil {
-		return nil, fmt.Errorf("pdf: bad startxref offset: %w", err)
+		return fmt.Errorf("pdf: bad startxref offset: %w", err)
 	}
-	objects := map[int]Object{}
-	trailer, err := parseXRefSection(data, xrefOffset, objects)
+
+	trailer, err := d.parseXRefSection(xrefOffset, map[int]bool{})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	root, _ := trailer["Root"].(Ref)
 	info, _ := trailer["Info"].(Ref)
-	return &DocumentModel{
-		Objects: objects,
-		Root:    root,
-		Info:    info,
-		Trailer: trailer,
-	}, nil
+	d.Root = root
+	d.Info = info
+	d.Trailer = trailer
+	return nil
 }
 
-func parseXRefSection(data []byte, offset int, objects map[int]Object) (Dict, error) {
-	if offset < 0 || offset >= len(data) {
+func (d *DocumentModel) readRange(offset, length int) ([]byte, error) {
+	if offset < 0 || length < 0 {
+		return nil, errors.New("pdf: invalid read range")
+	}
+	if int64(offset) >= d.size {
+		return nil, io.EOF
+	}
+	if int64(offset+length) > d.size {
+		length = int(d.size) - offset
+	}
+	buf := make([]byte, length)
+	total := 0
+	for total < length {
+		n, err := d.ra.ReadAt(buf[total:], int64(offset+total))
+		total += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return buf[:total], err
+		}
+	}
+	return buf[:total], nil
+}
+
+func (d *DocumentModel) parseXRefSection(offset int, visited map[int]bool) (Dict, error) {
+	if offset < 0 || int64(offset) >= d.size {
 		return nil, errors.New("pdf: xref offset out of range")
 	}
-	s := data[offset:]
-	if bytes.HasPrefix(s, []byte("xref")) {
-		return parseClassicXRef(data, offset, objects)
+	if visited[offset] {
+		return nil, errors.New("pdf: cyclic xref Prev")
 	}
-	// xref stream
-	obj, id, err := parseIndirectAt(data, offset)
+	visited[offset] = true
+
+	probe, err := d.readRange(offset, 16)
+	if err != nil && len(probe) == 0 {
+		return nil, err
+	}
+	if bytes.HasPrefix(probe, []byte("xref")) {
+		return d.parseClassicXRef(offset, visited)
+	}
+	obj, id, err := d.parseIndirectAtOffset(offset)
 	if err != nil {
 		return nil, err
 	}
@@ -73,12 +156,21 @@ func parseXRefSection(data []byte, offset int, objects map[int]Object) (Dict, er
 	if !ok {
 		return nil, errors.New("pdf: expected xref stream")
 	}
-	objects[id] = st
-	return parseXRefStream(data, st, objects)
+	d.cache[id] = st
+	return d.parseXRefStream(st, visited)
 }
 
-func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, error) {
-	p := offset
+func (d *DocumentModel) parseClassicXRef(offset int, visited map[int]bool) (Dict, error) {
+	// Xref tables are small relative to content; read a generous window.
+	window := 4 << 20
+	if int64(offset+window) > d.size {
+		window = int(d.size) - offset
+	}
+	data, err := d.readRange(offset, window)
+	if err != nil && len(data) == 0 {
+		return nil, err
+	}
+	p := 0
 	if !bytes.HasPrefix(data[p:], []byte("xref")) {
 		return nil, errors.New("pdf: expected xref")
 	}
@@ -89,7 +181,11 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 		}
 	}
 	skipWSBytes()
-	entries := []struct{ id, offset, gen int; free bool }{}
+	type xrefRow struct {
+		id, offset, gen int
+		free           bool
+	}
+	entries := []xrefRow{}
 	for {
 		skipWSBytes()
 		if p >= len(data) {
@@ -98,7 +194,6 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 		if bytes.HasPrefix(data[p:], []byte("trailer")) {
 			break
 		}
-		// subsection header: start count
 		line := readLine(data, &p)
 		parts := strings.Fields(line)
 		if len(parts) != 2 {
@@ -115,10 +210,7 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 			off, _ := strconv.Atoi(fields[0])
 			gen, _ := strconv.Atoi(fields[1])
 			free := fields[2] == "f"
-			entries = append(entries, struct {
-				id, offset, gen int
-				free            bool
-			}{start + i, off, gen, free})
+			entries = append(entries, xrefRow{start + i, off, gen, free})
 		}
 	}
 	skipWSBytes()
@@ -139,21 +231,16 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 		if e.free || e.id == 0 {
 			continue
 		}
-		if _, exists := objects[e.id]; exists {
+		if _, exists := d.xref[e.id]; exists {
 			continue
 		}
-		obj, _, err := parseIndirectAt(data, e.offset)
-		if err != nil {
-			return nil, fmt.Errorf("pdf: object %d at %d: %w", e.id, e.offset, err)
-		}
-		objects[e.id] = obj
+		d.xref[e.id] = xrefEntry{typ: 1, offset: e.offset, genOrIndex: e.gen}
 	}
 	if prev, ok := trailer["Prev"].(Number); ok {
-		prevTrailer, err := parseXRefSection(data, int(prev), objects)
+		prevTrailer, err := d.parseXRefSection(int(prev), visited)
 		if err != nil {
 			return nil, err
 		}
-		// merge missing keys from older trailer
 		for k, v := range prevTrailer {
 			if _, ok := trailer[k]; !ok {
 				trailer[k] = v
@@ -163,27 +250,34 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 	return trailer, nil
 }
 
-func parseXRefStream(data []byte, st Stream, objects map[int]Object) (Dict, error) {
+func (d *DocumentModel) parseXRefStream(st Stream, visited map[int]bool) (Dict, error) {
 	raw, err := decodeStream(st)
 	if err != nil {
 		return nil, fmt.Errorf("pdf: xref stream decode: %w", err)
 	}
 	size, _ := st.Dict["Size"].(Number)
-	wArr, _ := st.Dict["W"].(Array)
-	if len(wArr) != 3 {
+	wArr, ok := st.Dict["W"].(Array)
+	if !ok || len(wArr) != 3 {
 		return nil, errors.New("pdf: bad xref stream W")
 	}
-	w0 := int(wArr[0].(Number))
-	w1 := int(wArr[1].(Number))
-	w2 := int(wArr[2].(Number))
-	entryLen := w0 + w1 + w2
+	w0, ok0 := wArr[0].(Number)
+	w1, ok1 := wArr[1].(Number)
+	w2, ok2 := wArr[2].(Number)
+	if !ok0 || !ok1 || !ok2 {
+		return nil, errors.New("pdf: bad xref stream W types")
+	}
+	wi0, wi1, wi2 := int(w0), int(w1), int(w2)
+	entryLen := wi0 + wi1 + wi2
 	index := []int{0, int(size)}
 	if idx, ok := st.Dict["Index"].(Array); ok && len(idx) >= 2 {
 		index = index[:0]
 		for i := 0; i+1 < len(idx); i += 2 {
-			start := int(idx[i].(Number))
-			count := int(idx[i+1].(Number))
-			index = append(index, start, count)
+			startN, okS := idx[i].(Number)
+			countN, okC := idx[i+1].(Number)
+			if !okS || !okC {
+				return nil, errors.New("pdf: bad xref stream Index")
+			}
+			index = append(index, int(startN), int(countN))
 		}
 	}
 	pos := 0
@@ -202,38 +296,29 @@ func parseXRefStream(data []byte, st Stream, objects map[int]Object) (Dict, erro
 				return nil, errors.New("pdf: truncated xref stream")
 			}
 			var typ, field1, field2 int
-			if w0 == 0 {
+			if wi0 == 0 {
 				typ = 1
 			} else {
-				typ = readN(w0)
+				typ = readN(wi0)
 			}
-			field1 = readN(w1)
-			field2 = readN(w2)
+			field1 = readN(wi1)
+			field2 = readN(wi2)
 			id := start + j
 			if id == 0 {
 				continue
 			}
-			if _, exists := objects[id]; exists {
+			if _, exists := d.xref[id]; exists {
 				continue
 			}
 			switch typ {
 			case 0:
 				// free
 			case 1:
-				obj, _, err := parseIndirectAt(data, field1)
-				if err != nil {
-					return nil, fmt.Errorf("pdf: object %d at %d: %w", id, field1, err)
-				}
-				objects[id] = obj
+				d.xref[id] = xrefEntry{typ: 1, offset: field1, genOrIndex: field2}
 			case 2:
-				// object stream: field1 = stream obj, field2 = index — resolve later
-				objects[id] = objStreamRef{streamID: field1, index: field2}
+				d.xref[id] = xrefEntry{typ: 2, offset: field1, genOrIndex: field2}
 			}
 		}
-	}
-	// inflate object streams
-	if err := resolveObjStreams(data, objects); err != nil {
-		return nil, err
 	}
 	trailer := Dict{}
 	for k, v := range st.Dict {
@@ -243,7 +328,7 @@ func parseXRefStream(data []byte, st Stream, objects map[int]Object) (Dict, erro
 		trailer[k] = v
 	}
 	if prev, ok := trailer["Prev"].(Number); ok {
-		prevTrailer, err := parseXRefSection(data, int(prev), objects)
+		prevTrailer, err := d.parseXRefSection(int(prev), visited)
 		if err != nil {
 			return nil, err
 		}
@@ -256,83 +341,182 @@ func parseXRefStream(data []byte, st Stream, objects map[int]Object) (Dict, erro
 	return trailer, nil
 }
 
-type objStreamRef struct {
-	streamID int
-	index    int
+// parseIndirectAtOffset reads and parses one indirect object starting at file offset.
+func (d *DocumentModel) parseIndirectAtOffset(offset int) (Object, int, error) {
+	chunk := 64 << 10
+	for {
+		end := offset + chunk
+		if int64(end) > d.size {
+			end = int(d.size)
+		}
+		data, err := d.readRange(offset, end-offset)
+		if err != nil && len(data) == 0 {
+			return nil, 0, err
+		}
+		obj, id, err := parseIndirectAt(data, 0)
+		if err == nil {
+			return obj, id, nil
+		}
+		if int64(end) >= d.size {
+			return nil, 0, err
+		}
+		chunk *= 2
+		if chunk > 64<<20 {
+			chunk = 64 << 20
+		}
+	}
 }
 
-func (objStreamRef) WritePDF(w io.Writer) error {
-	return errors.New("pdf: unresolved object stream ref")
+func (d *DocumentModel) ensureSortedOffsets() {
+	if d.sortedOff != nil {
+		return
+	}
+	offs := make([]int, 0, len(d.xref))
+	for _, e := range d.xref {
+		if e.typ == 1 {
+			offs = append(offs, e.offset)
+		}
+	}
+	// insertion sort is fine for typical sizes; use simple sort
+	for i := 1; i < len(offs); i++ {
+		v := offs[i]
+		j := i
+		for j > 0 && offs[j-1] > v {
+			offs[j] = offs[j-1]
+			j--
+		}
+		offs[j] = v
+	}
+	d.sortedOff = offs
 }
 
-func resolveObjStreams(data []byte, objects map[int]Object) error {
-	// Load referenced object streams
-	for id, obj := range objects {
-		osr, ok := obj.(objStreamRef)
-		if !ok {
-			continue
+func (d *DocumentModel) objectEnd(start int) int {
+	d.ensureSortedOffsets()
+	// first offset strictly greater than start
+	lo, hi := 0, len(d.sortedOff)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if d.sortedOff[mid] <= start {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
-		stObj, ok := objects[osr.streamID]
-		if !ok {
-			var err error
-			stObj, _, err = findObjectByID(data, osr.streamID)
-			if err != nil {
-				return err
-			}
-			objects[osr.streamID] = stObj
+	}
+	if lo < len(d.sortedOff) {
+		return d.sortedOff[lo]
+	}
+	return int(d.size)
+}
+
+// Get loads object id on demand (cached).
+func (d *DocumentModel) Get(id int) (Object, error) {
+	if id <= 0 {
+		return nil, nil
+	}
+	if o, ok := d.cache[id]; ok {
+		return o, nil
+	}
+	ent, ok := d.xref[id]
+	if !ok {
+		return nil, fmt.Errorf("pdf: missing object %d", id)
+	}
+	switch ent.typ {
+	case 0:
+		return nil, nil
+	case 1:
+		end := d.objectEnd(ent.offset)
+		// Include a little slack before next object; streams may need it when Length is indirect.
+		length := end - ent.offset
+		if length < 256 {
+			length = 256
 		}
-		st, ok := stObj.(Stream)
-		if !ok {
-			return fmt.Errorf("pdf: object %d not a stream", osr.streamID)
+		if int64(ent.offset+length) > d.size {
+			length = int(d.size) - ent.offset
 		}
-		decoded, err := decodeStream(st)
+		data, err := d.readRange(ent.offset, length)
+		if err != nil && len(data) == 0 {
+			return nil, err
+		}
+		obj, _, err := parseIndirectAt(data, 0)
 		if err != nil {
-			return err
-		}
-		n, _ := st.Dict["N"].(Number)
-		first, _ := st.Dict["First"].(Number)
-		ids := make([]int, int(n))
-		p := 0
-		for i := 0; i < int(n); i++ {
-			skipWSBuf(decoded, &p)
-			ids[i] = readInt(decoded, &p)
-			skipWSBuf(decoded, &p)
-			_ = readInt(decoded, &p) // offset unused; we use First + sequential parse
-		}
-		p = int(first)
-		for i := 0; i < int(n); i++ {
-			skipWSBuf(decoded, &p)
-			o, err := parseObject(decoded, &p)
+			// Retry with a larger window up to EOF (Length-as-ref / unusual packing).
+			obj, _, err = d.parseIndirectAtOffset(ent.offset)
 			if err != nil {
-				return err
-			}
-			if _, exists := objects[ids[i]]; !exists || isObjStreamRef(objects[ids[i]]) {
-				objects[ids[i]] = o
+				return nil, fmt.Errorf("pdf: object %d at %d: %w", id, ent.offset, err)
 			}
 		}
-		_ = id
-	}
-	return nil
-}
-
-func isObjStreamRef(o Object) bool {
-	_, ok := o.(objStreamRef)
-	return ok
-}
-
-func findObjectByID(data []byte, id int) (Object, int, error) {
-	marker := []byte(fmt.Sprintf("\n%d 0 obj", id))
-	idx := bytes.Index(data, marker)
-	if idx < 0 {
-		marker = []byte(fmt.Sprintf("%d 0 obj", id))
-		idx = bytes.Index(data, marker)
-		if idx < 0 {
-			return nil, 0, fmt.Errorf("pdf: object %d not found", id)
+		d.cache[id] = obj
+		return obj, nil
+	case 2:
+		objs, err := d.loadObjStream(ent.offset)
+		if err != nil {
+			return nil, err
 		}
-	} else {
-		idx++ // skip leading \n
+		if ent.genOrIndex < 0 || ent.genOrIndex >= len(objs) {
+			return nil, fmt.Errorf("pdf: object stream index %d out of range", ent.genOrIndex)
+		}
+		obj := objs[ent.genOrIndex]
+		d.cache[id] = obj
+		return obj, nil
+	default:
+		return nil, fmt.Errorf("pdf: bad xref type %d for object %d", ent.typ, id)
 	}
-	return parseIndirectAt(data, idx)
+}
+
+func (d *DocumentModel) loadObjStream(streamID int) ([]Object, error) {
+	if d.objStmCache == nil {
+		d.objStmCache = map[int][]Object{}
+	}
+	if objs, ok := d.objStmCache[streamID]; ok {
+		return objs, nil
+	}
+	stObj, err := d.Get(streamID)
+	if err != nil {
+		return nil, err
+	}
+	st, ok := stObj.(Stream)
+	if !ok {
+		return nil, fmt.Errorf("pdf: object %d not a stream", streamID)
+	}
+	decoded, err := decodeStream(st)
+	if err != nil {
+		return nil, err
+	}
+	nNum, _ := st.Dict["N"].(Number)
+	firstNum, _ := st.Dict["First"].(Number)
+	n := int(nNum)
+	if n < 0 {
+		return nil, errors.New("pdf: negative object stream N")
+	}
+	// Cap absurd allocations from malicious /N.
+	const maxObjStreamN = 1_000_000
+	if n > maxObjStreamN {
+		return nil, fmt.Errorf("pdf: object stream N too large: %d", n)
+	}
+	ids := make([]int, n)
+	p := 0
+	for i := 0; i < n; i++ {
+		skipWSBuf(decoded, &p)
+		ids[i] = readInt(decoded, &p)
+		skipWSBuf(decoded, &p)
+		_ = readInt(decoded, &p)
+	}
+	p = int(firstNum)
+	objs := make([]Object, n)
+	for i := 0; i < n; i++ {
+		skipWSBuf(decoded, &p)
+		o, err := parseObject(decoded, &p)
+		if err != nil {
+			return nil, err
+		}
+		objs[i] = o
+		// Also cache by declared id when not yet present.
+		if _, ok := d.cache[ids[i]]; !ok {
+			d.cache[ids[i]] = o
+		}
+	}
+	d.objStmCache[streamID] = objs
+	return objs, nil
 }
 
 func decodeStream(st Stream) ([]byte, error) {
@@ -880,17 +1064,18 @@ func min(a, b int) int {
 	return b
 }
 
-// Resolve follows refs in the document model.
+// Resolve follows refs in the document model (lazy-loading as needed).
 func (d *DocumentModel) Resolve(obj Object) Object {
 	for i := 0; i < 32; i++ {
 		ref, ok := obj.(Ref)
 		if !ok {
 			return obj
 		}
-		obj = d.Objects[ref.ID]
-		if obj == nil {
+		next, err := d.Get(ref.ID)
+		if err != nil || next == nil {
 			return nil
 		}
+		obj = next
 	}
 	return obj
 }
