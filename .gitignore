@@ -3,4 +3,3 @@ artifacts/
 *.pdf
 !testdata/**
 .DS_Store
-testdata/*.pdf

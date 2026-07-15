@@ -144,7 +144,7 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 		}
 		obj, _, err := parseIndirectAt(data, e.offset)
 		if err != nil {
-			return nil, fmt.Errorf("pdf: object %d: %w", e.id, err)
+			return nil, fmt.Errorf("pdf: object %d at %d: %w", e.id, e.offset, err)
 		}
 		objects[e.id] = obj
 	}
@@ -164,17 +164,9 @@ func parseClassicXRef(data []byte, offset int, objects map[int]Object) (Dict, er
 }
 
 func parseXRefStream(data []byte, st Stream, objects map[int]Object) (Dict, error) {
-	raw := st.Data
-	if filt, ok := st.Dict["Filter"].(Name); ok && filt == "FlateDecode" {
-		zr, err := zlib.NewReader(bytes.NewReader(raw))
-		if err != nil {
-			return nil, err
-		}
-		defer zr.Close()
-		raw, err = io.ReadAll(zr)
-		if err != nil {
-			return nil, err
-		}
+	raw, err := decodeStream(st)
+	if err != nil {
+		return nil, fmt.Errorf("pdf: xref stream decode: %w", err)
 	}
 	size, _ := st.Dict["Size"].(Number)
 	wArr, _ := st.Dict["W"].(Array)
@@ -230,7 +222,7 @@ func parseXRefStream(data []byte, st Stream, objects map[int]Object) (Dict, erro
 			case 1:
 				obj, _, err := parseIndirectAt(data, field1)
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("pdf: object %d at %d: %w", id, field1, err)
 				}
 				objects[id] = obj
 			case 2:
@@ -345,33 +337,181 @@ func findObjectByID(data []byte, id int) (Object, int, error) {
 
 func decodeStream(st Stream) ([]byte, error) {
 	data := st.Data
-	switch f := st.Dict["Filter"].(type) {
-	case Name:
-		if f == "FlateDecode" {
+	filters, parms := normalizeFilters(st.Dict)
+	for i, f := range filters {
+		switch f {
+		case "FlateDecode", "Fl":
 			zr, err := zlib.NewReader(bytes.NewReader(data))
 			if err != nil {
 				return nil, err
 			}
-			defer zr.Close()
-			return io.ReadAll(zr)
-		}
-	case Array:
-		// only support single Flate for now
-		if len(f) == 1 {
-			if n, ok := f[0].(Name); ok && n == "FlateDecode" {
-				zr, err := zlib.NewReader(bytes.NewReader(data))
-				if err != nil {
-					return nil, err
-				}
-				defer zr.Close()
-				return io.ReadAll(zr)
+			inflated, err := io.ReadAll(zr)
+			zr.Close()
+			if err != nil {
+				return nil, err
 			}
+			data, err = applyPredictor(inflated, parms[i])
+			if err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("pdf: unsupported filter %s", f)
 		}
 	}
 	return data, nil
 }
 
+func normalizeFilters(d Dict) ([]Name, []Dict) {
+	var filters []Name
+	switch f := d["Filter"].(type) {
+	case Name:
+		filters = []Name{f}
+	case Array:
+		for _, v := range f {
+			if n, ok := v.(Name); ok {
+				filters = append(filters, n)
+			}
+		}
+	}
+	parms := make([]Dict, len(filters))
+	switch p := d["DecodeParms"].(type) {
+	case Dict:
+		if len(filters) == 1 {
+			parms[0] = p
+		}
+	case Array:
+		for i := 0; i < len(filters) && i < len(p); i++ {
+			if dp, ok := p[i].(Dict); ok {
+				parms[i] = dp
+			}
+		}
+	}
+	return filters, parms
+}
+
+// applyPredictor undoes TIFF/PNG predictors used with FlateDecode (common on xref streams).
+func applyPredictor(data []byte, parms Dict) ([]byte, error) {
+	if parms == nil {
+		return data, nil
+	}
+	predictor := 1
+	if n, ok := parms["Predictor"].(Number); ok {
+		predictor = int(n)
+	}
+	if predictor <= 1 {
+		return data, nil
+	}
+	columns := 1
+	if n, ok := parms["Columns"].(Number); ok && int(n) > 0 {
+		columns = int(n)
+	}
+	colors := 1
+	if n, ok := parms["Colors"].(Number); ok && int(n) > 0 {
+		colors = int(n)
+	}
+	bpc := 8
+	if n, ok := parms["BitsPerComponent"].(Number); ok && int(n) > 0 {
+		bpc = int(n)
+	}
+	// bytes per pixel / sample group
+	bpp := (colors*bpc + 7) / 8
+	rowLen := (columns*colors*bpc + 7) / 8
+	if rowLen <= 0 {
+		return nil, errors.New("pdf: bad predictor row length")
+	}
+
+	if predictor == 2 {
+		// TIFF predictor: horizontal differencing, no per-row tag byte
+		if len(data)%rowLen != 0 {
+			return nil, errors.New("pdf: truncated TIFF predictor data")
+		}
+		out := make([]byte, len(data))
+		for i := 0; i < len(data); i += rowLen {
+			copy(out[i:i+rowLen], data[i:i+rowLen])
+			for j := bpp; j < rowLen; j++ {
+				out[i+j] = (out[i+j] + out[i+j-bpp]) & 0xff
+			}
+		}
+		return out, nil
+	}
+	if predictor < 10 || predictor > 15 {
+		return nil, fmt.Errorf("pdf: unsupported predictor %d", predictor)
+	}
+
+	// PNG predictors 10–15: each row is filter-byte + rowLen samples
+	stride := rowLen + 1
+	if len(data)%stride != 0 {
+		return nil, errors.New("pdf: truncated PNG predictor data")
+	}
+	out := make([]byte, 0, len(data)/stride*rowLen)
+	prev := make([]byte, rowLen)
+	cur := make([]byte, rowLen)
+	for i := 0; i < len(data); i += stride {
+		ft := data[i]
+		copy(cur, data[i+1:i+stride])
+		switch ft {
+		case 0: // None
+		case 1: // Sub
+			for j := bpp; j < rowLen; j++ {
+				cur[j] = (cur[j] + cur[j-bpp]) & 0xff
+			}
+		case 2: // Up
+			for j := 0; j < rowLen; j++ {
+				cur[j] = (cur[j] + prev[j]) & 0xff
+			}
+		case 3: // Average
+			for j := 0; j < rowLen; j++ {
+				left := byte(0)
+				if j >= bpp {
+					left = cur[j-bpp]
+				}
+				cur[j] = (cur[j] + byte((int(left)+int(prev[j]))/2)) & 0xff
+			}
+		case 4: // Paeth
+			for j := 0; j < rowLen; j++ {
+				left := byte(0)
+				upLeft := byte(0)
+				if j >= bpp {
+					left = cur[j-bpp]
+					upLeft = prev[j-bpp]
+				}
+				cur[j] = (cur[j] + paethPredictor(left, prev[j], upLeft)) & 0xff
+			}
+		default:
+			return nil, fmt.Errorf("pdf: bad PNG filter type %d", ft)
+		}
+		out = append(out, cur...)
+		copy(prev, cur)
+	}
+	return out, nil
+}
+
+func paethPredictor(a, b, c byte) byte {
+	// a = left, b = above, c = upper left
+	p := int(a) + int(b) - int(c)
+	pa := absInt(p - int(a))
+	pb := absInt(p - int(b))
+	pc := absInt(p - int(c))
+	if pa <= pb && pa <= pc {
+		return a
+	}
+	if pb <= pc {
+		return b
+	}
+	return c
+}
+
+func absInt(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
 func parseIndirectAt(data []byte, offset int) (Object, int, error) {
+	if offset < 0 || offset >= len(data) {
+		return nil, 0, fmt.Errorf("pdf: object offset %d out of range (len %d)", offset, len(data))
+	}
 	p := offset
 	skipWSBuf(data, &p)
 	id := readInt(data, &p)
@@ -711,6 +851,12 @@ func readInt(data []byte, p *int) int {
 }
 
 func readNumberToken(data []byte, p *int) string {
+	if *p < 0 {
+		*p = 0
+	}
+	if *p > len(data) {
+		*p = len(data)
+	}
 	start := *p
 	if *p < len(data) && (data[*p] == '+' || data[*p] == '-') {
 		*p++
