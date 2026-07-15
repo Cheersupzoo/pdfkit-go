@@ -2,6 +2,7 @@ package pdfkit_test
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -213,5 +214,114 @@ func TestMergeFilesMaterializesAndDropsSources(t *testing.T) {
 	if !bytes.HasPrefix(b, []byte("%PDF")) {
 		t.Fatal("bad merge output")
 	}
+}
+
+func TestStampPreservesImportedFontsWhenFontIsRef(t *testing.T) {
+	raw := mustBuildPDFWithIndirectFontDict(t)
+	path := filepath.Join(t.TempDir(), "sheet.pdf")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := pdfkit.OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+
+	doc.SwitchToPage(0)
+	doc.Font("Helvetica").FontSize(10)
+	doc.Text("page 1", pdfkit.TextOptions{X: 72, Y: 40})
+
+	out, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("/FSheet")) {
+		t.Fatal("imported font /FSheet missing after stamp save")
+	}
+	if !bytes.Contains(out, []byte("/FontFile2")) {
+		t.Fatal("embedded FontFile2 missing after stamp save")
+	}
+	if !bytes.Contains(out, []byte("/Helvetica")) {
+		t.Fatal("stamp Helvetica missing")
+	}
+}
+
+func TestMergePreservesIndirectLengthFontStream(t *testing.T) {
+	raw := mustBuildPDFWithIndirectLengthFont(t)
+	path := filepath.Join(t.TempDir(), "fontlen.pdf")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outDoc := pdfkit.New()
+	if err := outDoc.MergeFiles(path); err != nil {
+		t.Fatal(err)
+	}
+	outDoc.SwitchToPage(0)
+	outDoc.Font("Helvetica").FontSize(8)
+	outDoc.Text("footer", pdfkit.TextOptions{X: 50, Y: 30})
+
+	out, err := outDoc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out, []byte("/FontFile2")) {
+		t.Fatal("FontFile2 missing after merge+stamp")
+	}
+	if !bytes.Contains(out, []byte("FONTMARKER_TAIL")) {
+		t.Fatal("font stream payload truncated after merge")
+	}
+	if !bytes.Contains(out, []byte("/FSheet")) {
+		t.Fatal("imported /FSheet dropped after stamp")
+	}
+}
+
+func mustBuildPDFWithIndirectFontDict(t *testing.T) []byte {
+	t.Helper()
+	return mustBuildPDFWithIndirectLengthFont(t)
+}
+
+func mustBuildPDFWithIndirectLengthFont(t *testing.T) []byte {
+	t.Helper()
+	payload := append([]byte("AAAA"), []byte("endstream")...)
+	payload = append(payload, bytes.Repeat([]byte{0xCD}, 2000)...)
+	payload = append(payload, []byte("FONTMARKER_TAIL")...)
+
+	content := "BT /FSheet 12 Tf 72 700 Td (Hi) Tj ET\n"
+	var body bytes.Buffer
+	body.WriteString("%PDF-1.7\n%\xE2\xE3\xCF\xD3\n")
+	off := make([]int, 10)
+	write := func(id int, s string) {
+		off[id] = body.Len()
+		fmt.Fprintf(&body, "%d 0 obj\n%s\nendobj\n", id, s)
+	}
+
+	write(1, fmt.Sprintf("%d", len(payload)))
+	off[2] = body.Len()
+	fmt.Fprintf(&body, "2 0 obj\n<< /Length 1 0 R >>\nstream\n")
+	body.Write(payload)
+	body.WriteString("\nendstream\nendobj\n")
+
+	write(3, "<< /Type /FontDescriptor /FontName /Fake /Flags 32 /FontBBox [0 0 1000 1000] "+
+		"/ItalicAngle 0 /Ascent 800 /Descent -200 /CapHeight 700 /StemV 80 /FontFile2 2 0 R >>")
+	write(4, "<< /Type /Font /Subtype /TrueType /BaseFont /Fake /FontDescriptor 3 0 R "+
+		"/FirstChar 32 /LastChar 32 /Widths [500] >>")
+	write(5, "<< /FSheet 4 0 R >>")
+	write(6, "<< /Type /Pages /Kids [7 0 R] /Count 1 >>")
+	off[8] = body.Len()
+	fmt.Fprintf(&body, "8 0 obj\n<< /Length %d >>\nstream\n%s\nendstream\nendobj\n", len(content), content)
+	write(7, "<< /Type /Page /Parent 6 0 R /MediaBox [0 0 612 792] "+
+		"/Resources << /Font 5 0 R >> /Contents 8 0 R >>")
+	write(9, "<< /Type /Catalog /Pages 6 0 R >>")
+
+	xref := body.Len()
+	fmt.Fprintf(&body, "xref\n0 10\n0000000000 65535 f \n")
+	for id := 1; id <= 9; id++ {
+		fmt.Fprintf(&body, "%010d 00000 n \n", off[id])
+	}
+	fmt.Fprintf(&body, "trailer\n<< /Size 10 /Root 9 0 R >>\nstartxref\n%d\n%%%%EOF\n", xref)
+	return body.Bytes()
 }
 
