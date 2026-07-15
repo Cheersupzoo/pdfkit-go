@@ -109,3 +109,41 @@ func TestMerge(t *testing.T) {
 	}
 }
 
+// TestImportSaveDedupesFonts ensures open→save reuses shared font objects across pages
+// instead of cloning FontFile2 once per page.
+func TestImportSaveDedupesFonts(t *testing.T) {
+	doc := pdfkit.New()
+	if err := doc.RegisterFontFile("DejaVu", "testdata/fonts/DejaVuSans.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		doc.AddPage()
+		doc.Font("DejaVu").FontSize(12)
+		doc.Text("page", pdfkit.TextOptions{X: 72, Y: 700})
+	}
+	orig, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origFonts := bytes.Count(orig, []byte("/FontFile2"))
+	if origFonts < 1 {
+		t.Fatalf("expected embedded font in original, got %d FontFile2", origFonts)
+	}
+
+	opened, err := pdfkit.Open(bytes.NewReader(orig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := opened.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outFonts := bytes.Count(out, []byte("/FontFile2"))
+	if outFonts != origFonts {
+		t.Fatalf("font streams not deduped on import save: orig=%d out=%d", origFonts, outFonts)
+	}
+	if opened.PageCount() != 5 {
+		t.Fatalf("expected 5 pages, got %d", opened.PageCount())
+	}
+}
+

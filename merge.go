@@ -204,6 +204,18 @@ func (d *Document) saveWithImports(w io.Writer) error {
 		extRefs[name] = cat.Add(eg.dict)
 	}
 
+	// Deduplicate cloned indirect objects per source document across all pages.
+	// Object IDs are only unique within a single PDF, so the seen map is keyed by source.
+	seenBySrc := map[*pdf.DocumentModel]map[int]pdf.Ref{}
+	seenFor := func(src *pdf.DocumentModel) map[int]pdf.Ref {
+		if m, ok := seenBySrc[src]; ok {
+			return m
+		}
+		m := map[int]pdf.Ref{}
+		seenBySrc[src] = m
+		return m
+	}
+
 	var builtPages []pdf.Ref
 	for _, page := range d.pages {
 		var contentRefs pdf.Array
@@ -212,28 +224,29 @@ func (d *Document) saveWithImports(w io.Writer) error {
 		}
 
 		if page.imported != nil {
-			srcPage, err := page.imported.src.GetPageDict(page.imported.ref)
+			src := page.imported.src
+			seen := seenFor(src)
+			srcPage, err := src.GetPageDict(page.imported.ref)
 			if err != nil {
 				return err
 			}
-			// copy original contents
-			origContents := page.imported.src.Resolve(srcPage["Contents"])
-			switch c := origContents.(type) {
-			case pdf.Stream:
-				contentRefs = append(contentRefs, cat.Add(cloneObject(c, page.imported.src, cat, map[int]pdf.Ref{})))
+			// Copy original contents; pass Refs through cloneObject so shared streams dedupe.
+			switch c := srcPage["Contents"].(type) {
+			case pdf.Ref, pdf.Stream:
+				contentRefs = append(contentRefs, cloneIntoCatalog(c, src, cat, seen))
 			case pdf.Array:
 				for _, item := range c {
-					obj := page.imported.src.Resolve(item)
-					contentRefs = append(contentRefs, cat.Add(cloneObject(obj, page.imported.src, cat, map[int]pdf.Ref{})))
+					contentRefs = append(contentRefs, cloneIntoCatalog(item, src, cat, seen))
 				}
-			case pdf.Ref:
-				obj := page.imported.src.Resolve(c)
-				contentRefs = append(contentRefs, cat.Add(cloneObject(obj, page.imported.src, cat, map[int]pdf.Ref{})))
+			default:
+				if resolved := src.Resolve(srcPage["Contents"]); resolved != nil {
+					contentRefs = append(contentRefs, cloneIntoCatalog(resolved, src, cat, seen))
+				}
 			}
-			// merge original resources shallowly (fonts/xobjects by cloning)
-			if res := page.imported.src.Resolve(srcPage["Resources"]); res != nil {
+			// Merge original resources (fonts/xobjects); nested Refs share seen across pages.
+			if res := src.Resolve(srcPage["Resources"]); res != nil {
 				if rd, ok := res.(pdf.Dict); ok {
-					resources = mergeResources(resources, cloneObject(rd, page.imported.src, cat, map[int]pdf.Ref{}).(pdf.Dict))
+					resources = mergeResources(resources, cloneObject(rd, src, cat, seen).(pdf.Dict))
 				}
 			}
 		}
@@ -360,6 +373,16 @@ func mergeResources(a, b pdf.Dict) pdf.Dict {
 	return out
 }
 
+// cloneIntoCatalog clones obj into cat and returns a Ref. If obj is already a Ref,
+// the shared seen map ensures the same source object is only materialized once.
+func cloneIntoCatalog(obj pdf.Object, src *pdf.DocumentModel, cat *pdf.Catalog, seen map[int]pdf.Ref) pdf.Ref {
+	cloned := cloneObject(obj, src, cat, seen)
+	if ref, ok := cloned.(pdf.Ref); ok {
+		return ref
+	}
+	return cat.Add(cloned)
+}
+
 func cloneObject(obj pdf.Object, src *pdf.DocumentModel, cat *pdf.Catalog, seen map[int]pdf.Ref) pdf.Object {
 	switch o := obj.(type) {
 	case pdf.Ref:
@@ -371,7 +394,7 @@ func cloneObject(obj pdf.Object, src *pdf.DocumentModel, cat *pdf.Catalog, seen 
 		placeholder := cat.Add(pdf.Null{})
 		seen[o.ID] = placeholder
 		cloned := cloneObject(resolved, src, cat, seen)
-		cat.Set(placeholder.ID, cloned.(pdf.Object))
+		cat.Set(placeholder.ID, cloned)
 		return placeholder
 	case pdf.Dict:
 		nd := pdf.Dict{}

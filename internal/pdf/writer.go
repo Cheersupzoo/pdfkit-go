@@ -37,40 +37,53 @@ func (c *Catalog) Get(id int) Object {
 	return c.objects[id]
 }
 
-// Write writes a complete PDF 1.7 file.
+// countingWriter tracks bytes written so xref offsets can be computed
+// without buffering the entire PDF in memory.
+type countingWriter struct {
+	w io.Writer
+	n int
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	nw, err := c.w.Write(p)
+	c.n += nw
+	return nw, err
+}
+
+// Write writes a complete PDF 1.7 file, streaming objects directly to w.
 func (c *Catalog) Write(w io.Writer, root Ref, info Ref) error {
-	var buf bytes.Buffer
-	if _, err := buf.WriteString("%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"); err != nil {
+	cw := &countingWriter{w: w}
+	if _, err := io.WriteString(cw, "%PDF-1.7\n%\xE2\xE3\xCF\xD3\n"); err != nil {
 		return err
 	}
 	offsets := make([]int, len(c.objects))
 	for id := 1; id < len(c.objects); id++ {
-		offsets[id] = buf.Len()
+		offsets[id] = cw.n
 		obj := c.objects[id]
-		if _, err := fmt.Fprintf(&buf, "%d 0 obj\n", id); err != nil {
+		if _, err := fmt.Fprintf(cw, "%d 0 obj\n", id); err != nil {
 			return err
 		}
 		if obj == nil {
-			if err := (Null{}).WritePDF(&buf); err != nil {
+			if err := (Null{}).WritePDF(cw); err != nil {
 				return err
 			}
-		} else if err := obj.WritePDF(&buf); err != nil {
+		} else if err := obj.WritePDF(cw); err != nil {
 			return err
 		}
-		if _, err := buf.WriteString("\nendobj\n"); err != nil {
+		if _, err := io.WriteString(cw, "\nendobj\n"); err != nil {
 			return err
 		}
 	}
-	xrefPos := buf.Len()
+	xrefPos := cw.n
 	n := len(c.objects)
-	if _, err := fmt.Fprintf(&buf, "xref\n0 %d\n", n); err != nil {
+	if _, err := fmt.Fprintf(cw, "xref\n0 %d\n", n); err != nil {
 		return err
 	}
-	if _, err := buf.WriteString("0000000000 65535 f \n"); err != nil {
+	if _, err := io.WriteString(cw, "0000000000 65535 f \n"); err != nil {
 		return err
 	}
 	for id := 1; id < n; id++ {
-		if _, err := fmt.Fprintf(&buf, "%010d 00000 n \n", offsets[id]); err != nil {
+		if _, err := fmt.Fprintf(cw, "%010d 00000 n \n", offsets[id]); err != nil {
 			return err
 		}
 	}
@@ -81,16 +94,13 @@ func (c *Catalog) Write(w io.Writer, root Ref, info Ref) error {
 	if info.ID > 0 {
 		trailer["Info"] = info
 	}
-	if _, err := buf.WriteString("trailer\n"); err != nil {
+	if _, err := io.WriteString(cw, "trailer\n"); err != nil {
 		return err
 	}
-	if err := trailer.WritePDF(&buf); err != nil {
+	if err := trailer.WritePDF(cw); err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(&buf, "\nstartxref\n%d\n%%%%EOF\n", xrefPos); err != nil {
-		return err
-	}
-	_, err := w.Write(buf.Bytes())
+	_, err := fmt.Fprintf(cw, "\nstartxref\n%d\n%%%%EOF\n", xrefPos)
 	return err
 }
 
