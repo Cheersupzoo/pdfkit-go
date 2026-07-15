@@ -2,7 +2,9 @@ package pdfkit_test
 
 import (
 	"bytes"
+	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	pdfkit "github.com/Cheersupzoo/pdfkit-go"
@@ -105,6 +107,110 @@ func TestMerge(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.HasPrefix(out, []byte("%PDF")) {
+		t.Fatal("bad merge output")
+	}
+}
+
+// TestImportSaveDedupesFonts ensures open→save reuses shared font objects across pages
+// instead of cloning FontFile2 once per page.
+func TestImportSaveDedupesFonts(t *testing.T) {
+	doc := pdfkit.New()
+	if err := doc.RegisterFontFile("DejaVu", "testdata/fonts/DejaVuSans.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		doc.AddPage()
+		doc.Font("DejaVu").FontSize(12)
+		doc.Text("page", pdfkit.TextOptions{X: 72, Y: 700})
+	}
+	orig, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origFonts := bytes.Count(orig, []byte("/FontFile2"))
+	if origFonts < 1 {
+		t.Fatalf("expected embedded font in original, got %d FontFile2", origFonts)
+	}
+
+	opened, err := pdfkit.Open(bytes.NewReader(orig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := opened.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outFonts := bytes.Count(out, []byte("/FontFile2"))
+	if outFonts != origFonts {
+		t.Fatalf("font streams not deduped on import save: orig=%d out=%d", origFonts, outFonts)
+	}
+	if opened.PageCount() != 5 {
+		t.Fatalf("expected 5 pages, got %d", opened.PageCount())
+	}
+}
+
+func TestOpenSpoolsPipe(t *testing.T) {
+	doc := pdfkit.New()
+	doc.AddPage()
+	doc.Text("pipe", pdfkit.TextOptions{X: 72, Y: 700})
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write(raw)
+		_ = pw.Close()
+	}()
+	opened, err := pdfkit.Open(pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if opened.PageCount() != 1 {
+		t.Fatalf("pages=%d", opened.PageCount())
+	}
+	out, err := opened.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(out, []byte("%PDF")) {
+		t.Fatal("bad output")
+	}
+}
+
+func TestMergeFilesMaterializesAndDropsSources(t *testing.T) {
+	dir := t.TempDir()
+	var paths []string
+	for i := 0; i < 3; i++ {
+		d := pdfkit.New()
+		d.AddPage()
+		d.Text("m", pdfkit.TextOptions{X: 72, Y: 700})
+		b, err := d.Bytes()
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(dir, string(rune('a'+i))+".pdf")
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, path)
+	}
+	out := pdfkit.New()
+	if err := out.MergeFiles(paths...); err != nil {
+		t.Fatal(err)
+	}
+	if out.PageCount() != 3 {
+		t.Fatalf("pages=%d", out.PageCount())
+	}
+	if out.HasLiveImportSource() {
+		t.Fatal("MergeFiles should release source models after materialize")
+	}
+	b, err := out.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(b, []byte("%PDF")) {
 		t.Fatal("bad merge output")
 	}
 }

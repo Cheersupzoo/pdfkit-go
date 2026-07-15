@@ -45,8 +45,8 @@ type Document struct {
 	textX, textY   float64
 	autoHyphen     bool
 	err            error
-	imported       *pdf.DocumentModel
-	importedPages  []pdf.Ref
+	imported       *pdf.DocumentModel // open source until materialize/Close
+	importCat      *pdf.Catalog       // owned objects from materialized imports
 }
 
 type margins struct {
@@ -168,6 +168,26 @@ func (d *Document) Save(w io.Writer) error {
 		}
 	}
 	return d.saveFresh(w)
+}
+
+// Close releases any file/temp resources held by an opened PDF.
+// After Close, Save still works if pages were already materialized (e.g. after Merge);
+// otherwise Open'd pages must be saved before Close, or Save will materialize first while the source is open.
+func (d *Document) Close() error {
+	if d == nil {
+		return nil
+	}
+	var err error
+	if d.imported != nil {
+		err = d.imported.Close()
+		d.imported = nil
+	}
+	for _, p := range d.pages {
+		if p.imported != nil {
+			p.imported.src = nil
+		}
+	}
+	return err
 }
 
 func (d *Document) saveFresh(w io.Writer) error {

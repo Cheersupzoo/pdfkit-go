@@ -3,3 +3,4 @@ artifacts/
 *.pdf
 !testdata/**
 .DS_Store
+testdata/thai_shape_smoke.pdf
