@@ -134,8 +134,11 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
+	// Do not wrap the run in ActualText. Chrome/PDFium maps that span onto
+	// the first glyph's box, so a full-line select highlights only one
+	// character. Copy-paste comes from ToUnicode; highlight width comes
+	// from CIDFont /W (Tj advances) with Td reserved for GPOS.
 	p.write("BT /%s %.5f Tf %.5f %.5f Td\n", fr.name, d.fontSize, x, y)
-	p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
 	for _, g := range glyphs {
 		w := fr.glyphWidthPoints(g.OrigGID, d.fontSize)
 		if g.XOffset != 0 || g.YOffset != 0 {
@@ -147,7 +150,7 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		p.write("<%04X> Tj\n", g.SubsetID)
 		writeTd(p, g.XAdvance-w, 0)
 	}
-	p.write("EMC\nET\n")
+	p.write("ET\n")
 }
 
 func writeTd(p *Page, dx, dy float64) {

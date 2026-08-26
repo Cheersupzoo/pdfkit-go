@@ -60,8 +60,10 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
-	if !contentContains(t, raw, []byte("/ActualText")) {
-		t.Fatal("embedded text missing ActualText marked content for copy-paste")
+	// ActualText on a multi-glyph span collapses Chrome's highlight to the
+	// first character. Copy comes from ToUnicode instead.
+	if contentContains(t, raw, []byte("/ActualText")) {
+		t.Fatal("embedded text should not use ActualText; it collapses selection highlights")
 	}
 }
 
