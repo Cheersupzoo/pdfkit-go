@@ -134,8 +134,8 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// DW=0 fonts: Tj does not advance; we place each glyph with Td using shaped advances/offsets.
 	p.write("BT /%s %.5f Tf %.5f %.5f Td\n", fr.name, d.fontSize, x, y)
+	p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
 	for _, g := range glyphs {
 		if g.XOffset != 0 || g.YOffset != 0 {
 			p.write("%.5f %.5f Td <%04X> Tj %.5f %.5f Td\n",
@@ -144,7 +144,7 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		}
 		p.write("<%04X> Tj %.5f 0 Td\n", g.SubsetID, g.XAdvance)
 	}
-	p.write("ET\n")
+	p.write("EMC\nET\n")
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {

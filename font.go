@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
+	"unicode/utf16"
 
 	"github.com/boxesandglue/textshape/ot"
 	fontlib "github.com/tdewolff/font"
@@ -13,19 +15,20 @@ import (
 )
 
 type fontResource struct {
-	name        string // resource name e.g. F1
-	baseName    string // Helvetica or embedded PostScript name
-	standard    bool
-	sfnt        *fontlib.SFNT
-	raw         []byte
-	usedGlyphs  map[uint16]bool
-	runeGlyph   map[rune]uint16
-	subset      bool
-	subsetIndex map[uint16]uint16 // original glyph -> subset glyph id
-	subsetOrder []uint16          // subset glyph id -> original
-	shapeFont   *ot.Font
-	shaper      *ot.Shaper
-	upem        float64
+	name          string // resource name e.g. F1
+	baseName      string // Helvetica or embedded PostScript name
+	standard      bool
+	sfnt          *fontlib.SFNT
+	raw           []byte
+	usedGlyphs    map[uint16]bool
+	runeGlyph     map[rune]uint16
+	glyphUnicodes map[uint16][]rune // original GID -> Unicode (for ToUnicode)
+	subset        bool
+	subsetIndex   map[uint16]uint16 // original glyph -> subset glyph id
+	subsetOrder   []uint16          // subset glyph id -> original
+	shapeFont     *ot.Font
+	shaper        *ot.Shaper
+	upem          float64
 }
 
 var standardFonts = map[string]bool{
@@ -76,16 +79,17 @@ func (d *Document) RegisterFont(family string, data []byte, index int) error {
 	}
 	resName := sanitizeFontRes(family)
 	fr := &fontResource{
-		name:        resName,
-		baseName:    family,
-		standard:    false,
-		sfnt:        sfnt,
-		raw:         sfntBytes,
-		usedGlyphs:  map[uint16]bool{0: true},
-		runeGlyph:   map[rune]uint16{},
-		subset:      true,
-		subsetIndex: map[uint16]uint16{0: 0},
-		subsetOrder: []uint16{0},
+		name:          resName,
+		baseName:      family,
+		standard:      false,
+		sfnt:          sfnt,
+		raw:           sfntBytes,
+		usedGlyphs:    map[uint16]bool{0: true},
+		runeGlyph:     map[rune]uint16{},
+		glyphUnicodes: map[uint16][]rune{},
+		subset:        true,
+		subsetIndex:   map[uint16]uint16{0: 0},
+		subsetOrder:   []uint16{0},
 	}
 	d.fonts[resName] = fr
 	d.fonts[family] = fr
@@ -128,6 +132,36 @@ func (fr *fontResource) glyphFor(r rune) uint16 {
 	fr.runeGlyph[r] = g
 	fr.usedGlyphs[g] = true
 	return fr.subsetID(g)
+}
+
+func (fr *fontResource) recordGlyphUnicode(orig uint16, runes []rune) {
+	if orig == 0 || len(runes) == 0 {
+		return
+	}
+	if fr.glyphUnicodes == nil {
+		fr.glyphUnicodes = map[uint16][]rune{}
+	}
+	if existing, ok := fr.glyphUnicodes[orig]; ok && len(existing) > 0 {
+		return
+	}
+	cleaned := make([]rune, 0, len(runes))
+	for _, r := range runes {
+		if r != 0 && r <= 0x10FFFF {
+			cleaned = append(cleaned, r)
+		}
+	}
+	if len(cleaned) == 0 {
+		return
+	}
+	fr.glyphUnicodes[orig] = cleaned
+	if len(cleaned) == 1 {
+		if fr.runeGlyph == nil {
+			fr.runeGlyph = map[rune]uint16{}
+		}
+		if _, ok := fr.runeGlyph[cleaned[0]]; !ok {
+			fr.runeGlyph[cleaned[0]] = orig
+		}
+	}
 }
 
 func (fr *fontResource) subsetID(orig uint16) uint16 {
@@ -300,41 +334,99 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 }
 
 func buildToUnicode(fr *fontResource, glyphMap map[uint16]uint16) string {
-	// map new glyph id -> rune
-	rev := map[uint16]rune{}
-	for r, old := range fr.runeGlyph {
-		if ng, ok := glyphMap[old]; ok {
-			rev[ng] = r
+	type pair struct {
+		cid uint16
+		dst string
+	}
+	seen := map[uint16]bool{}
+	var pairs []pair
+	add := func(orig uint16, runes []rune) {
+		cid, ok := glyphMap[orig]
+		if !ok || seen[cid] {
+			return
+		}
+		hex := encodeUTF16BEHex(runes)
+		if hex == "" {
+			return
+		}
+		seen[cid] = true
+		pairs = append(pairs, pair{cid: cid, dst: hex})
+	}
+
+	for orig, runes := range fr.glyphUnicodes {
+		add(orig, runes)
+	}
+	for r, orig := range fr.runeGlyph {
+		add(orig, []rune{r})
+	}
+	if fr.sfnt != nil {
+		for orig, cid := range glyphMap {
+			if orig == 0 || seen[cid] {
+				continue
+			}
+			rs := fr.sfnt.GlyphToUnicode(orig)
+			if len(rs) == 0 {
+				continue
+			}
+			add(orig, []rune{pickToUnicodeRune(rs)})
 		}
 	}
-	var b []byte
-	b = append(b, []byte("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n")...)
-	b = append(b, []byte("/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n")...)
-	b = append(b, []byte("/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n")...)
-	b = append(b, []byte("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n")...)
-	type pair struct {
-		g uint16
-		r rune
-	}
-	var pairs []pair
-	for g, r := range rev {
-		pairs = append(pairs, pair{g, r})
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].g < pairs[j].g })
+
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].cid < pairs[j].cid })
+
+	var b strings.Builder
+	b.WriteString("/CIDInit /ProcSet findresource begin\n")
+	b.WriteString("12 dict begin\n")
+	b.WriteString("begincmap\n")
+	b.WriteString("/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n")
+	b.WriteString("/CMapName /Adobe-Identity-UCS def\n")
+	b.WriteString("/CMapType 2 def\n")
+	b.WriteString("/WMode 0 def\n")
+	b.WriteString("1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n")
 	const chunk = 100
 	for i := 0; i < len(pairs); i += chunk {
 		end := i + chunk
 		if end > len(pairs) {
 			end = len(pairs)
 		}
-		b = append(b, []byte(fmt.Sprintf("%d beginbfchar\n", end-i))...)
+		fmt.Fprintf(&b, "%d beginbfchar\n", end-i)
 		for _, p := range pairs[i:end] {
-			b = append(b, []byte(fmt.Sprintf("<%04X> <%04X>\n", p.g, p.r))...)
+			fmt.Fprintf(&b, "<%04X> <%s>\n", p.cid, p.dst)
 		}
-		b = append(b, []byte("endbfchar\n")...)
+		b.WriteString("endbfchar\n")
 	}
-	b = append(b, []byte("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n")...)
-	return string(b)
+	b.WriteString("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n")
+	return b.String()
+}
+
+func encodeUTF16BEHex(runes []rune) string {
+	var b strings.Builder
+	for _, r := range runes {
+		if r == 0 || r > 0x10FFFF {
+			continue
+		}
+		if r > 0xFFFF {
+			s1, s2 := utf16.EncodeRune(r)
+			fmt.Fprintf(&b, "%04X%04X", s1, s2)
+			continue
+		}
+		fmt.Fprintf(&b, "%04X", r)
+	}
+	return b.String()
+}
+
+func pickToUnicodeRune(rs []rune) rune {
+	for _, r := range rs {
+		if r > 0 && r < 0x80 {
+			return r
+		}
+	}
+	for _, r := range rs {
+		if r != 0 {
+			return r
+		}
+	}
+	return 0
 }
 
 // --- Standard font widths (WinAnsi, Helvetica-ish metrics) ---

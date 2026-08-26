@@ -51,6 +51,7 @@ func (fr *fontResource) shape(s string, size float64) []shapedGlyph {
 	fr.shaper.Shape(buf, nil)
 
 	scale := size / fr.upem
+	fr.recordShapedUnicode(s, buf.Info)
 	out := make([]shapedGlyph, 0, len(buf.Info))
 	for i, info := range buf.Info {
 		orig := uint16(info.GlyphID)
@@ -69,6 +70,69 @@ func (fr *fontResource) shape(s string, size float64) []shapedGlyph {
 	return out
 }
 
+// recordShapedUnicode maps original glyph IDs to source characters so the
+// embedded ToUnicode CMap can round-trip copy/paste. Identity-H CIDs are
+// subset glyph IDs, not Unicode; without this map Chrome copies garbage.
+func (fr *fontResource) recordShapedUnicode(s string, info []ot.GlyphInfo) {
+	if len(info) == 0 || s == "" {
+		return
+	}
+	runes := []rune(s)
+	for i, g := range info {
+		orig := uint16(g.GlyphID)
+		if orig == 0 {
+			continue
+		}
+		start, end := clusterRuneRange(runes, info, i)
+		prevSame := i > 0 && info[i-1].Cluster == g.Cluster
+		nextSame := i+1 < len(info) && info[i+1].Cluster == g.Cluster
+		idxInCluster := 0
+		if prevSame {
+			j := i
+			for j > 0 && info[j-1].Cluster == g.Cluster {
+				j--
+			}
+			idxInCluster = i - j
+		}
+
+		var mapped []rune
+		clusterRunes := runes[start:end]
+		switch {
+		case idxInCluster == 0 && !nextSame && len(clusterRunes) > 0:
+			mapped = clusterRunes
+		case idxInCluster < len(clusterRunes):
+			mapped = []rune{clusterRunes[idxInCluster]}
+		case g.Codepoint != 0 && g.Codepoint <= 0x10FFFF:
+			mapped = []rune{rune(g.Codepoint)}
+		}
+		fr.recordGlyphUnicode(orig, mapped)
+	}
+}
+
+func clusterRuneRange(runes []rune, info []ot.GlyphInfo, i int) (start, end int) {
+	start = info[i].Cluster
+	if start < 0 {
+		start = 0
+	}
+	if start > len(runes) {
+		start = len(runes)
+	}
+	end = len(runes)
+	for j := i + 1; j < len(info); j++ {
+		if info[j].Cluster > info[i].Cluster {
+			end = info[j].Cluster
+			break
+		}
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	if end < start {
+		end = start
+	}
+	return start, end
+}
+
 func (fr *fontResource) shapeFallback(s string, size float64) []shapedGlyph {
 	out := make([]shapedGlyph, 0, len(s))
 	for _, r := range s {
@@ -78,6 +142,7 @@ func (fr *fontResource) shapeFallback(s string, size float64) []shapedGlyph {
 		orig := fr.sfnt.GlyphIndex(r)
 		fr.runeGlyph[r] = orig
 		fr.usedGlyphs[orig] = true
+		fr.recordGlyphUnicode(orig, []rune{r})
 		sid := fr.subsetID(orig)
 		adv := float64(fr.sfnt.GlyphAdvance(orig)) * size / float64(fr.sfnt.UnitsPerEm())
 		out = append(out, shapedGlyph{OrigGID: orig, SubsetID: sid, XAdvance: adv})
