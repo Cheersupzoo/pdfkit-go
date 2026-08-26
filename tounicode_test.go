@@ -60,18 +60,8 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
-	spans := actualTextSpans(t, raw)
-	if len(spans) < 8 {
-		t.Fatalf("expected per-cluster ActualText spans, got %d: %q", len(spans), spans)
-	}
-	joined := strings.Join(spans, "")
-	if !strings.Contains(joined, code) || !strings.Contains(joined, thai) {
-		t.Fatalf("ActualText spans missing source text:\n spans=%q\n joined=%q", spans, joined)
-	}
-	for _, s := range spans {
-		if s == "ชีท > "+thai || s == thai {
-			t.Fatalf("ActualText still wraps a whole line; Chrome will highlight only the first glyph: %q", s)
-		}
+	if spans := actualTextSpans(t, raw); len(spans) != 0 {
+		t.Fatalf("ActualText BDC collapses Thai in Chrome; got spans %q", spans)
 	}
 }
 
@@ -101,26 +91,40 @@ func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
 	if nonzero < 5 {
 		t.Fatalf("expected several real CID widths for %q, got %v", label, widths)
 	}
-	// After Tj, remaining Td should be GPOS correction, not a full em-sized jump.
-	maxAbsTd := maxAbsTjFollowTd(t, raw)
-	if maxAbsTd > 8 {
-		t.Fatalf("Tj is followed by large Td (%.3f); widths are not driving advances", maxAbsTd)
-	}
 	got := extractEmbeddedCIDText(t, raw)
 	if !strings.Contains(got, label) {
 		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
 	}
-	spans := actualTextSpans(t, raw)
-	if len(spans) < 5 {
-		t.Fatalf("expected per-cluster ActualText for %q, got %d spans %q", label, len(spans), spans)
+	if spans := actualTextSpans(t, raw); len(spans) != 0 {
+		t.Fatalf("ActualText BDC collapses Thai in Chrome; got spans %q", spans)
 	}
-	if strings.Join(spans, "") != label {
-		t.Fatalf("ActualText clusters = %q want %q", strings.Join(spans, ""), label)
+}
+
+func TestEmbeddedThaiUsesAbsoluteTm(t *testing.T) {
+	const sample = "วันที่ : ผู้สอนเซ็นชื่อ : O-NET (50 คะแนน +++)"
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
 	}
-	for _, s := range spans {
-		if s == label {
-			t.Fatal("ActualText still wraps the whole line; Chrome will highlight only the first glyph")
-		}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(16)
+	doc.Text(sample, pdfkit.TextOptions{X: 72, Y: 750, Width: 450})
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contentContains(t, raw, []byte(" Tm\n")) {
+		t.Fatal("embedded Thai must be placed with Tm so /W cannot collapse GPOS runs")
+	}
+	if contentContains(t, raw, []byte("BDC")) {
+		t.Fatal("ActualText/BDC around glyphs; Chrome restores the text matrix and collapses Thai")
+	}
+	if spans := actualTextSpans(t, raw); len(spans) != 0 {
+		t.Fatalf("unexpected ActualText spans %q", spans)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if !strings.Contains(got, "วันที่") || !strings.Contains(got, "ผู้สอนเซ็นชื่อ") || !strings.Contains(got, "O-NET") {
+		t.Fatalf("missing labels in ToUnicode text: %q", got)
 	}
 }
 
@@ -327,10 +331,7 @@ func contentContains(t *testing.T, raw []byte, needle []byte) bool {
 	return false
 }
 
-var (
-	cidWidthRe   = regexp.MustCompile(`/W\s*\[\s*0\s*\[([^\]]+)\]`)
-	tjFollowTdRe = regexp.MustCompile(`Tj\s+(-?[0-9.]+)\s+(-?[0-9.]+)\s+Td`)
-)
+var cidWidthRe = regexp.MustCompile(`/W\s*\[\s*0\s*\[([^\]]+)\]`)
 
 func cidFontWidths(t *testing.T, raw []byte) []float64 {
 	t.Helper()
@@ -348,49 +349,6 @@ func cidFontWidths(t *testing.T, raw []byte) []float64 {
 		out = append(out, v)
 	}
 	return out
-}
-
-func maxAbsTjFollowTd(t *testing.T, raw []byte) float64 {
-	t.Helper()
-	model, err := pdf.Open(bytes.NewReader(raw))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer model.Close()
-	pageRefs, err := model.PageRefs()
-	if err != nil {
-		t.Fatal(err)
-	}
-	max := 0.0
-	for _, pref := range pageRefs {
-		pd, err := model.GetPageDict(pref)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
-			decoded, err := decodeFlateStream(st)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, m := range tjFollowTdRe.FindAllSubmatch(decoded, -1) {
-				dx, _ := strconv.ParseFloat(string(m[1]), 64)
-				dy, _ := strconv.ParseFloat(string(m[2]), 64)
-				if dx < 0 {
-					dx = -dx
-				}
-				if dy < 0 {
-					dy = -dy
-				}
-				if dx > max {
-					max = dx
-				}
-				if dy > max {
-					max = dy
-				}
-			}
-		}
-	}
-	return max
 }
 
 func parseBFChar(cmap string) map[uint16]string {
