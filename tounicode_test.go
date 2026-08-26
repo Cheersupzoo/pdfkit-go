@@ -33,6 +33,12 @@ func TestEmbeddedFontCopyPasteASCII(t *testing.T) {
 	if !strings.Contains(got, want) {
 		t.Fatalf("ToUnicode copy-paste mismatch:\n got %q\nwant substring %q", got, want)
 	}
+	if !bytes.Contains(raw, []byte("/W")) {
+		t.Fatal("CIDFont missing /W widths; Chrome inserts spaces when glyphs are zero-width")
+	}
+	if !hasBatchedCIDTj(t, raw) {
+		t.Fatal("expected a multi-glyph Tj run so copy-paste is not one CID per showing")
+	}
 }
 
 func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
@@ -59,6 +65,9 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	}
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
+	}
+	if !contentContains(t, raw, []byte("/ActualText")) {
+		t.Fatal("embedded text missing ActualText marked content for copy-paste")
 	}
 }
 
@@ -183,6 +192,65 @@ func decodeFlateStream(st pdf.Stream) ([]byte, error) {
 	}
 	defer zr.Close()
 	return io.ReadAll(zr)
+}
+
+func contentContains(t *testing.T, raw []byte, needle []byte) bool {
+	t.Helper()
+	model, err := pdf.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer model.Close()
+	pageRefs, err := model.PageRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pref := range pageRefs {
+		pd, err := model.GetPageDict(pref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
+			decoded, err := decodeFlateStream(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(decoded, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasBatchedCIDTj(t *testing.T, raw []byte) bool {
+	t.Helper()
+	model, err := pdf.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer model.Close()
+	pageRefs, err := model.PageRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	longTj := regexp.MustCompile(`<[0-9A-Fa-f]{8,}>\s*Tj`)
+	for _, pref := range pageRefs {
+		pd, err := model.GetPageDict(pref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
+			decoded, err := decodeFlateStream(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if longTj.Match(decoded) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseBFChar(cmap string) map[uint16]string {
