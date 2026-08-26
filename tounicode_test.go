@@ -60,10 +60,18 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
-	// ActualText on a multi-glyph span collapses Chrome's highlight to the
-	// first character. Copy comes from ToUnicode instead.
-	if contentContains(t, raw, []byte("/ActualText")) {
-		t.Fatal("embedded text should not use ActualText; it collapses selection highlights")
+	spans := actualTextSpans(t, raw)
+	if len(spans) < 8 {
+		t.Fatalf("expected per-cluster ActualText spans, got %d: %q", len(spans), spans)
+	}
+	joined := strings.Join(spans, "")
+	if !strings.Contains(joined, code) || !strings.Contains(joined, thai) {
+		t.Fatalf("ActualText spans missing source text:\n spans=%q\n joined=%q", spans, joined)
+	}
+	for _, s := range spans {
+		if s == "ชีท > "+thai || s == thai {
+			t.Fatalf("ActualText still wraps a whole line; Chrome will highlight only the first glyph: %q", s)
+		}
 	}
 }
 
@@ -101,6 +109,18 @@ func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
 	got := extractEmbeddedCIDText(t, raw)
 	if !strings.Contains(got, label) {
 		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
+	}
+	spans := actualTextSpans(t, raw)
+	if len(spans) < 5 {
+		t.Fatalf("expected per-cluster ActualText for %q, got %d spans %q", label, len(spans), spans)
+	}
+	if strings.Join(spans, "") != label {
+		t.Fatalf("ActualText clusters = %q want %q", strings.Join(spans, ""), label)
+	}
+	for _, s := range spans {
+		if s == label {
+			t.Fatal("ActualText still wraps the whole line; Chrome will highlight only the first glyph")
+		}
 	}
 }
 
@@ -225,6 +245,57 @@ func decodeFlateStream(st pdf.Stream) ([]byte, error) {
 	}
 	defer zr.Close()
 	return io.ReadAll(zr)
+}
+
+var actualTextRe = regexp.MustCompile(`/ActualText\s*<([0-9A-Fa-f]+)>`)
+
+func actualTextSpans(t *testing.T, raw []byte) []string {
+	t.Helper()
+	model, err := pdf.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer model.Close()
+	pageRefs, err := model.PageRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spans []string
+	for _, pref := range pageRefs {
+		pd, err := model.GetPageDict(pref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
+			decoded, err := decodeFlateStream(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range actualTextRe.FindAllSubmatch(decoded, -1) {
+				spans = append(spans, decodeUTF16BEHex(t, string(m[1])))
+			}
+		}
+	}
+	return spans
+}
+
+func decodeUTF16BEHex(t *testing.T, h string) string {
+	t.Helper()
+	if strings.HasPrefix(strings.ToUpper(h), "FEFF") {
+		h = h[4:]
+	}
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b)%2 != 0 {
+		t.Fatalf("odd UTF-16BE hex length %q", h)
+	}
+	u := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		u = append(u, binary.BigEndian.Uint16(b[i:i+2]))
+	}
+	return string(utf16.Decode(u))
 }
 
 func contentContains(t *testing.T, raw []byte, needle []byte) bool {

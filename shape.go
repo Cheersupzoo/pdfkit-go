@@ -135,8 +135,10 @@ func clusterRuneRange(runes []rune, info []ot.GlyphInfo, i int) (start, end int)
 
 func (fr *fontResource) shapeFallback(s string, size float64) []shapedGlyph {
 	out := make([]shapedGlyph, 0, len(s))
+	ri := 0
 	for _, r := range s {
 		if r == 0x00AD {
+			ri++
 			continue
 		}
 		orig := fr.sfnt.GlyphIndex(r)
@@ -145,7 +147,8 @@ func (fr *fontResource) shapeFallback(s string, size float64) []shapedGlyph {
 		fr.recordGlyphUnicode(orig, []rune{r})
 		sid := fr.subsetID(orig)
 		adv := float64(fr.sfnt.GlyphAdvance(orig)) * size / float64(fr.sfnt.UnitsPerEm())
-		out = append(out, shapedGlyph{OrigGID: orig, SubsetID: sid, XAdvance: adv})
+		out = append(out, shapedGlyph{OrigGID: orig, SubsetID: sid, XAdvance: adv, Cluster: ri})
+		ri++
 	}
 	return out
 }
