@@ -137,14 +137,24 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	p.write("BT /%s %.5f Tf %.5f %.5f Td\n", fr.name, d.fontSize, x, y)
 	p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
 	for _, g := range glyphs {
+		w := fr.glyphWidthPoints(g.OrigGID, d.fontSize)
 		if g.XOffset != 0 || g.YOffset != 0 {
-			p.write("%.5f %.5f Td <%04X> Tj %.5f %.5f Td\n",
-				g.XOffset, g.YOffset, g.SubsetID, g.XAdvance-g.XOffset, -g.YOffset)
+			writeTd(p, g.XOffset, g.YOffset)
+			p.write("<%04X> Tj\n", g.SubsetID)
+			writeTd(p, g.XAdvance-g.XOffset-w, -g.YOffset)
 			continue
 		}
-		p.write("<%04X> Tj %.5f 0 Td\n", g.SubsetID, g.XAdvance)
+		p.write("<%04X> Tj\n", g.SubsetID)
+		writeTd(p, g.XAdvance-w, 0)
 	}
 	p.write("EMC\nET\n")
+}
+
+func writeTd(p *Page, dx, dy float64) {
+	if dx > -1e-4 && dx < 1e-4 && dy > -1e-4 && dy < 1e-4 {
+		return
+	}
+	p.write("%.5f %.5f Td\n", dx, dy)
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {

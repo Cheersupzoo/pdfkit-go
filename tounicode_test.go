@@ -65,6 +65,43 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	}
 }
 
+func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
+	const label = "คะแนนรวม :"
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(24)
+	doc.Text(label, pdfkit.TextOptions{X: 72, Y: 750})
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("/W")) {
+		t.Fatal("CIDFont missing /W; Chrome uses DW=0 and highlights only the first glyph")
+	}
+	widths := cidFontWidths(t, raw)
+	nonzero := 0
+	for _, w := range widths {
+		if w > 200 {
+			nonzero++
+		}
+	}
+	if nonzero < 5 {
+		t.Fatalf("expected several real CID widths for %q, got %v", label, widths)
+	}
+	// After Tj, remaining Td should be GPOS correction, not a full em-sized jump.
+	maxAbsTd := maxAbsTjFollowTd(t, raw)
+	if maxAbsTd > 8 {
+		t.Fatalf("Tj is followed by large Td (%.3f); widths are not driving advances", maxAbsTd)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if !strings.Contains(got, label) {
+		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
+	}
+}
+
 var (
 	bfcharRe = regexp.MustCompile(`([0-9]+)\s+beginbfchar\s*((?:<[0-9A-Fa-f]+>\s*<(?:[0-9A-Fa-f]*)>\s*)+)endbfchar`)
 	pairRe   = regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>`)
@@ -215,6 +252,72 @@ func contentContains(t *testing.T, raw []byte, needle []byte) bool {
 		}
 	}
 	return false
+}
+
+var (
+	cidWidthRe   = regexp.MustCompile(`/W\s*\[\s*0\s*\[([^\]]+)\]`)
+	tjFollowTdRe = regexp.MustCompile(`Tj\s+(-?[0-9.]+)\s+(-?[0-9.]+)\s+Td`)
+)
+
+func cidFontWidths(t *testing.T, raw []byte) []float64 {
+	t.Helper()
+	m := cidWidthRe.FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("could not parse CIDFont /W array")
+	}
+	fields := strings.Fields(string(m[1]))
+	out := make([]float64, 0, len(fields))
+	for _, f := range fields {
+		v, err := strconv.ParseFloat(f, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func maxAbsTjFollowTd(t *testing.T, raw []byte) float64 {
+	t.Helper()
+	model, err := pdf.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer model.Close()
+	pageRefs, err := model.PageRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	max := 0.0
+	for _, pref := range pageRefs {
+		pd, err := model.GetPageDict(pref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
+			decoded, err := decodeFlateStream(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range tjFollowTdRe.FindAllSubmatch(decoded, -1) {
+				dx, _ := strconv.ParseFloat(string(m[1]), 64)
+				dy, _ := strconv.ParseFloat(string(m[2]), 64)
+				if dx < 0 {
+					dx = -dx
+				}
+				if dy < 0 {
+					dy = -dy
+				}
+				if dx > max {
+					max = dx
+				}
+				if dy > max {
+					max = dy
+				}
+			}
+		}
+	}
+	return max
 }
 
 func parseBFChar(cmap string) map[uint16]string {
