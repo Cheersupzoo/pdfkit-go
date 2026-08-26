@@ -134,17 +134,69 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
+	// Chrome maps ActualText onto the first glyph of the marked span.
+	// One span for the whole line therefore highlights only the first
+	// character. Tag each shaping cluster so copy stays exact while
+	// CIDFont /W still sizes every glyph. Td is reserved for GPOS.
 	p.write("BT /%s %.5f Tf %.5f %.5f Td\n", fr.name, d.fontSize, x, y)
-	p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
-	for _, g := range glyphs {
-		if g.XOffset != 0 || g.YOffset != 0 {
-			p.write("%.5f %.5f Td <%04X> Tj %.5f %.5f Td\n",
-				g.XOffset, g.YOffset, g.SubsetID, g.XAdvance-g.XOffset, -g.YOffset)
-			continue
+	for i := 0; i < len(glyphs); {
+		j := i + 1
+		for j < len(glyphs) && glyphs[j].Cluster == glyphs[i].Cluster {
+			j++
 		}
-		p.write("<%04X> Tj %.5f 0 Td\n", g.SubsetID, g.XAdvance)
+		src := clusterSource(line, glyphs, i, j)
+		if src != "" {
+			p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(src)))
+		}
+		for _, g := range glyphs[i:j] {
+			w := fr.glyphWidthPoints(g.OrigGID, d.fontSize)
+			if g.XOffset != 0 || g.YOffset != 0 {
+				writeTd(p, g.XOffset, g.YOffset)
+				p.write("<%04X> Tj\n", g.SubsetID)
+				writeTd(p, g.XAdvance-g.XOffset-w, -g.YOffset)
+				continue
+			}
+			p.write("<%04X> Tj\n", g.SubsetID)
+			writeTd(p, g.XAdvance-w, 0)
+		}
+		if src != "" {
+			p.write("EMC\n")
+		}
+		i = j
 	}
-	p.write("EMC\nET\n")
+	p.write("ET\n")
+}
+
+func clusterSource(line string, glyphs []shapedGlyph, i, j int) string {
+	runes := []rune(line)
+	if i < 0 || i >= len(glyphs) {
+		return ""
+	}
+	start := glyphs[i].Cluster
+	if start < 0 {
+		start = 0
+	}
+	if start > len(runes) {
+		start = len(runes)
+	}
+	end := len(runes)
+	if j < len(glyphs) {
+		end = glyphs[j].Cluster
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	if end < start {
+		end = start
+	}
+	return string(runes[start:end])
+}
+
+func writeTd(p *Page, dx, dy float64) {
+	if dx > -1e-4 && dx < 1e-4 && dy > -1e-4 && dy < 1e-4 {
+		return
+	}
+	p.write("%.5f %.5f Td\n", dx, dy)
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {

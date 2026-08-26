@@ -60,8 +60,67 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
-	if !contentContains(t, raw, []byte("/ActualText")) {
-		t.Fatal("embedded text missing ActualText marked content for copy-paste")
+	spans := actualTextSpans(t, raw)
+	if len(spans) < 8 {
+		t.Fatalf("expected per-cluster ActualText spans, got %d: %q", len(spans), spans)
+	}
+	joined := strings.Join(spans, "")
+	if !strings.Contains(joined, code) || !strings.Contains(joined, thai) {
+		t.Fatalf("ActualText spans missing source text:\n spans=%q\n joined=%q", spans, joined)
+	}
+	for _, s := range spans {
+		if s == "ชีท > "+thai || s == thai {
+			t.Fatalf("ActualText still wraps a whole line; Chrome will highlight only the first glyph: %q", s)
+		}
+	}
+}
+
+func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
+	const label = "คะแนนรวม :"
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(24)
+	doc.Text(label, pdfkit.TextOptions{X: 72, Y: 750})
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte("/W")) {
+		t.Fatal("CIDFont missing /W; Chrome uses DW=0 and highlights only the first glyph")
+	}
+	widths := cidFontWidths(t, raw)
+	nonzero := 0
+	for _, w := range widths {
+		if w > 200 {
+			nonzero++
+		}
+	}
+	if nonzero < 5 {
+		t.Fatalf("expected several real CID widths for %q, got %v", label, widths)
+	}
+	// After Tj, remaining Td should be GPOS correction, not a full em-sized jump.
+	maxAbsTd := maxAbsTjFollowTd(t, raw)
+	if maxAbsTd > 8 {
+		t.Fatalf("Tj is followed by large Td (%.3f); widths are not driving advances", maxAbsTd)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if !strings.Contains(got, label) {
+		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
+	}
+	spans := actualTextSpans(t, raw)
+	if len(spans) < 5 {
+		t.Fatalf("expected per-cluster ActualText for %q, got %d spans %q", label, len(spans), spans)
+	}
+	if strings.Join(spans, "") != label {
+		t.Fatalf("ActualText clusters = %q want %q", strings.Join(spans, ""), label)
+	}
+	for _, s := range spans {
+		if s == label {
+			t.Fatal("ActualText still wraps the whole line; Chrome will highlight only the first glyph")
+		}
 	}
 }
 
@@ -188,6 +247,57 @@ func decodeFlateStream(st pdf.Stream) ([]byte, error) {
 	return io.ReadAll(zr)
 }
 
+var actualTextRe = regexp.MustCompile(`/ActualText\s*<([0-9A-Fa-f]+)>`)
+
+func actualTextSpans(t *testing.T, raw []byte) []string {
+	t.Helper()
+	model, err := pdf.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer model.Close()
+	pageRefs, err := model.PageRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spans []string
+	for _, pref := range pageRefs {
+		pd, err := model.GetPageDict(pref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
+			decoded, err := decodeFlateStream(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range actualTextRe.FindAllSubmatch(decoded, -1) {
+				spans = append(spans, decodeUTF16BEHex(t, string(m[1])))
+			}
+		}
+	}
+	return spans
+}
+
+func decodeUTF16BEHex(t *testing.T, h string) string {
+	t.Helper()
+	if strings.HasPrefix(strings.ToUpper(h), "FEFF") {
+		h = h[4:]
+	}
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b)%2 != 0 {
+		t.Fatalf("odd UTF-16BE hex length %q", h)
+	}
+	u := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		u = append(u, binary.BigEndian.Uint16(b[i:i+2]))
+	}
+	return string(utf16.Decode(u))
+}
+
 func contentContains(t *testing.T, raw []byte, needle []byte) bool {
 	t.Helper()
 	model, err := pdf.Open(bytes.NewReader(raw))
@@ -215,6 +325,72 @@ func contentContains(t *testing.T, raw []byte, needle []byte) bool {
 		}
 	}
 	return false
+}
+
+var (
+	cidWidthRe   = regexp.MustCompile(`/W\s*\[\s*0\s*\[([^\]]+)\]`)
+	tjFollowTdRe = regexp.MustCompile(`Tj\s+(-?[0-9.]+)\s+(-?[0-9.]+)\s+Td`)
+)
+
+func cidFontWidths(t *testing.T, raw []byte) []float64 {
+	t.Helper()
+	m := cidWidthRe.FindSubmatch(raw)
+	if m == nil {
+		t.Fatal("could not parse CIDFont /W array")
+	}
+	fields := strings.Fields(string(m[1]))
+	out := make([]float64, 0, len(fields))
+	for _, f := range fields {
+		v, err := strconv.ParseFloat(f, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func maxAbsTjFollowTd(t *testing.T, raw []byte) float64 {
+	t.Helper()
+	model, err := pdf.Open(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer model.Close()
+	pageRefs, err := model.PageRefs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	max := 0.0
+	for _, pref := range pageRefs {
+		pd, err := model.GetPageDict(pref)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, st := range contentStreams(model, model.Resolve(pd["Contents"])) {
+			decoded, err := decodeFlateStream(st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range tjFollowTdRe.FindAllSubmatch(decoded, -1) {
+				dx, _ := strconv.ParseFloat(string(m[1]), 64)
+				dy, _ := strconv.ParseFloat(string(m[2]), 64)
+				if dx < 0 {
+					dx = -dx
+				}
+				if dy < 0 {
+					dy = -dy
+				}
+				if dx > max {
+					max = dx
+				}
+				if dy > max {
+					max = dy
+				}
+			}
+		}
+	}
+	return max
 }
 
 func parseBFChar(cmap string) map[uint16]string {
