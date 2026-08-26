@@ -197,30 +197,6 @@ func (fr *fontResource) advance(r rune, size float64) float64 {
 	return float64(fr.sfnt.GlyphAdvance(orig)) * size / upem
 }
 
-func (fr *fontResource) glyphWidthPoints(orig uint16, size float64) float64 {
-	if fr.standard || fr.sfnt == nil {
-		return 0
-	}
-	upem := float64(fr.sfnt.UnitsPerEm())
-	if upem == 0 {
-		upem = 1000
-	}
-	return float64(fr.sfnt.GlyphAdvance(orig)) * size / upem
-}
-
-func (fr *fontResource) cidWidthArray(glyphs []uint16) pdf.Array {
-	upem := float64(fr.sfnt.UnitsPerEm())
-	if upem == 0 {
-		upem = 1000
-	}
-	scale := 1000 / upem
-	w := make(pdf.Array, len(glyphs))
-	for i, orig := range glyphs {
-		w[i] = pdf.Number(float64(fr.sfnt.GlyphAdvance(orig)) * scale)
-	}
-	return pdf.Array{pdf.Number(0), w}
-}
-
 func (fr *fontResource) lineHeight(size float64) float64 {
 	if fr.standard {
 		return size * 1.2
@@ -326,9 +302,8 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 	}
 	descRef := cat.Add(descriptor)
 
-	// W gives each CID its hmtx advance so extractors (Chrome) do not treat
-	// glyphs as zero-width. GPOS kerning/offsets are applied in the content
-	// stream as Td corrections after Tj.
+	// Widths are applied in the content stream via Td after OpenType shaping
+	// (needed for complex scripts). Keep DW=0 so Tj does not double-advance.
 	cidFont := pdf.Dict{
 		"Type":           pdf.Name("Font"),
 		"Subtype":        pdf.Name("CIDFontType2"),
@@ -336,7 +311,6 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 		"CIDSystemInfo":  pdf.Dict{"Registry": pdf.String("Adobe"), "Ordering": pdf.String("Identity"), "Supplement": pdf.Number(0)},
 		"FontDescriptor": descRef,
 		"DW":             pdf.Number(0),
-		"W":              fr.cidWidthArray(glyphs),
 		"CIDToGIDMap":    pdf.Name("Identity"),
 	}
 	cidRef := cat.Add(cidFont)
