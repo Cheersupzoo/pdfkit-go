@@ -134,13 +134,12 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// Place every glyph with Tm at the shaped origin so paint does not
-	// depend on CIDFont /W (v0.6 layout). Chrome Find/select still walks
-	// CIDs in stream order and maps combining marks in visual/glyph order
-	// (ที่ → ท่ี, ุ on its own line). Tag each OpenType cluster with
-	// ActualText of the source runes so copy/Find use logical Unicode.
-	// Tm is absolute, so EMC restoring the text matrix cannot collapse
-	// later glyphs the way incremental Td did in v0.8.
+	// One Tm per OpenType cluster so Chrome treats base+marks as a single
+	// run on one line. Per-glyph Tm put marks at the next character's x
+	// (GPOS origin) and PDFium then copied ุ / ่ onto their own lines.
+	// ActualText is the source cluster (ที่ not ท่ี). Combining-mark CIDs
+	// have empty ToUnicode so they cannot leak into copy if ActualText is
+	// ignored. Paint still follows shaped positions via Td inside the cluster.
 	p.write("BT /%s %.5f Tf\n", fr.name, d.fontSize)
 	type placedGlyph struct {
 		g      shapedGlyph
@@ -161,9 +160,13 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		if src != "" {
 			p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(src)))
 		}
+		p.write("1 0 0 1 %.5f %.5f Tm\n", placed[i].px, placed[i].py)
+		curX, curY := placed[i].px, placed[i].py
 		for _, pl := range placed[i:j] {
-			p.write("1 0 0 1 %.5f %.5f Tm\n", pl.px, pl.py)
+			writeTd(p, pl.px-curX, pl.py-curY)
 			p.write("<%04X> Tj\n", pl.g.SubsetID)
+			w := fr.glyphWidthPoints(pl.g.OrigGID, d.fontSize)
+			curX, curY = pl.px+w, pl.py
 		}
 		if src != "" {
 			p.write("EMC\n")
@@ -171,6 +174,13 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		i = j
 	}
 	p.write("ET\n")
+}
+
+func writeTd(p *Page, dx, dy float64) {
+	if dx > -1e-4 && dx < 1e-4 && dy > -1e-4 && dy < 1e-4 {
+		return
+	}
+	p.write("%.5f %.5f Td\n", dx, dy)
 }
 
 func clusterSource(line string, glyphs []shapedGlyph, i, j int) string {

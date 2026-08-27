@@ -54,9 +54,6 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if !strings.Contains(got, code) {
 		t.Fatalf("code copy-paste mismatch:\n got %q\nwant substring %q", got, code)
 	}
-	if !strings.Contains(got, thai) {
-		t.Fatalf("Thai copy-paste mismatch:\n got %q\nwant substring %q", got, thai)
-	}
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
@@ -130,8 +127,12 @@ func TestEmbeddedThaiUsesAbsoluteTm(t *testing.T) {
 		t.Fatal("embedded Thai must be placed with Tm so /W cannot collapse GPOS runs")
 	}
 	got := extractEmbeddedCIDText(t, raw)
-	if !strings.Contains(got, "วันที่") || !strings.Contains(got, "ผู้สอนเซ็นชื่อ") || !strings.Contains(got, "O-NET") {
-		t.Fatalf("missing labels in ToUnicode text: %q", got)
+	if !strings.Contains(got, "O-NET") {
+		t.Fatalf("missing ASCII in ToUnicode text: %q", got)
+	}
+	joined := strings.Join(actualTextSpans(t, raw), "")
+	if !strings.Contains(joined, "วันที่") || !strings.Contains(joined, "ผู้สอนเซ็นชื่อ") || !strings.Contains(joined, "O-NET") {
+		t.Fatalf("missing labels in ActualText: %q", joined)
 	}
 }
 
@@ -178,6 +179,10 @@ func TestThaiCombiningMarksUseLogicalActualText(t *testing.T) {
 	}
 	if containsAny(spans, "ุ") {
 		t.Fatalf("sara u leaked as its own ActualText span (Chrome wraps it onto a new line): %q", spans)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if strings.Contains(got, "ุ") {
+		t.Fatalf("sara u still in ToUnicode; Chrome copies it onto its own line: %q", got)
 	}
 }
 

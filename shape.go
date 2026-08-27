@@ -95,10 +95,18 @@ func (fr *fontResource) recordShapedUnicode(s string, info []ot.GlyphInfo) {
 			idxInCluster = i - j
 		}
 
+		if idxInCluster > 0 {
+			if fr.suppressToUnicode == nil {
+				fr.suppressToUnicode = map[uint16]bool{}
+			}
+			fr.suppressToUnicode[orig] = true
+			continue
+		}
+
 		var mapped []rune
 		clusterRunes := runes[start:end]
 		switch {
-		case idxInCluster == 0 && !nextSame && len(clusterRunes) > 0:
+		case !nextSame && len(clusterRunes) > 0:
 			mapped = clusterRunes
 		case idxInCluster < len(clusterRunes):
 			mapped = []rune{clusterRunes[idxInCluster]}

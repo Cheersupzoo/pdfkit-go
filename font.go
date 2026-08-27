@@ -15,20 +15,21 @@ import (
 )
 
 type fontResource struct {
-	name          string // resource name e.g. F1
-	baseName      string // Helvetica or embedded PostScript name
-	standard      bool
-	sfnt          *fontlib.SFNT
-	raw           []byte
-	usedGlyphs    map[uint16]bool
-	runeGlyph     map[rune]uint16
-	glyphUnicodes map[uint16][]rune // original GID -> Unicode (for ToUnicode)
-	subset        bool
-	subsetIndex   map[uint16]uint16 // original glyph -> subset glyph id
-	subsetOrder   []uint16          // subset glyph id -> original
-	shapeFont     *ot.Font
-	shaper        *ot.Shaper
-	upem          float64
+	name              string // resource name e.g. F1
+	baseName          string // Helvetica or embedded PostScript name
+	standard          bool
+	sfnt              *fontlib.SFNT
+	raw               []byte
+	usedGlyphs        map[uint16]bool
+	runeGlyph         map[rune]uint16
+	glyphUnicodes     map[uint16][]rune // original GID -> Unicode (for ToUnicode)
+	suppressToUnicode map[uint16]bool   // combining-mark GIDs: empty CMap so Chrome won't wrap them
+	subset            bool
+	subsetIndex       map[uint16]uint16 // original glyph -> subset glyph id
+	subsetOrder       []uint16          // subset glyph id -> original
+	shapeFont         *ot.Font
+	shaper            *ot.Shaper
+	upem              float64
 }
 
 var standardFonts = map[string]bool{
@@ -79,17 +80,18 @@ func (d *Document) RegisterFont(family string, data []byte, index int) error {
 	}
 	resName := sanitizeFontRes(family)
 	fr := &fontResource{
-		name:          resName,
-		baseName:      family,
-		standard:      false,
-		sfnt:          sfnt,
-		raw:           sfntBytes,
-		usedGlyphs:    map[uint16]bool{0: true},
-		runeGlyph:     map[rune]uint16{},
-		glyphUnicodes: map[uint16][]rune{},
-		subset:        true,
-		subsetIndex:   map[uint16]uint16{0: 0},
-		subsetOrder:   []uint16{0},
+		name:              resName,
+		baseName:          family,
+		standard:          false,
+		sfnt:              sfnt,
+		raw:               sfntBytes,
+		usedGlyphs:        map[uint16]bool{0: true},
+		runeGlyph:         map[rune]uint16{},
+		glyphUnicodes:     map[uint16][]rune{},
+		suppressToUnicode: map[uint16]bool{},
+		subset:            true,
+		subsetIndex:       map[uint16]uint16{0: 0},
+		subsetOrder:       []uint16{0},
 	}
 	d.fonts[resName] = fr
 	d.fonts[family] = fr
@@ -189,6 +191,17 @@ func (fr *fontResource) advance(r rune, size float64) float64 {
 		fr.runeGlyph[r] = orig
 		fr.usedGlyphs[orig] = true
 		_ = fr.subsetID(orig)
+	}
+	upem := float64(fr.sfnt.UnitsPerEm())
+	if upem == 0 {
+		upem = 1000
+	}
+	return float64(fr.sfnt.GlyphAdvance(orig)) * size / upem
+}
+
+func (fr *fontResource) glyphWidthPoints(orig uint16, size float64) float64 {
+	if fr.standard || fr.sfnt == nil {
+		return 0
 	}
 	upem := float64(fr.sfnt.UnitsPerEm())
 	if upem == 0 {
@@ -358,6 +371,11 @@ func buildToUnicode(fr *fontResource, glyphMap map[uint16]uint16) string {
 	add := func(orig uint16, runes []rune) {
 		cid, ok := glyphMap[orig]
 		if !ok || seen[cid] {
+			return
+		}
+		if fr.suppressToUnicode[orig] {
+			seen[cid] = true
+			pairs = append(pairs, pair{cid: cid, dst: ""})
 			return
 		}
 		hex := encodeUTF16BEHex(runes)
