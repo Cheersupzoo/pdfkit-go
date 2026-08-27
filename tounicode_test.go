@@ -60,8 +60,15 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
-	if spans := actualTextSpans(t, raw); len(spans) != 0 {
-		t.Fatalf("ActualText BDC collapses Thai in Chrome; got spans %q", spans)
+	spans := actualTextSpans(t, raw)
+	joined := strings.Join(spans, "")
+	if !strings.Contains(joined, code) || !strings.Contains(joined, thai) {
+		t.Fatalf("ActualText missing source text:\n spans=%q\n joined=%q", spans, joined)
+	}
+	for _, s := range spans {
+		if s == "ชีท > "+thai || s == thai {
+			t.Fatalf("ActualText still wraps a whole line; Chrome will highlight only the first glyph: %q", s)
+		}
 	}
 }
 
@@ -95,8 +102,14 @@ func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
 	if !strings.Contains(got, label) {
 		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
 	}
-	if spans := actualTextSpans(t, raw); len(spans) != 0 {
-		t.Fatalf("ActualText BDC collapses Thai in Chrome; got spans %q", spans)
+	spans := actualTextSpans(t, raw)
+	if strings.Join(spans, "") != label {
+		t.Fatalf("ActualText clusters = %q want %q", strings.Join(spans, ""), label)
+	}
+	for _, s := range spans {
+		if s == label {
+			t.Fatal("ActualText still wraps the whole line; Chrome will highlight only the first glyph")
+		}
 	}
 }
 
@@ -116,16 +129,65 @@ func TestEmbeddedThaiUsesAbsoluteTm(t *testing.T) {
 	if !contentContains(t, raw, []byte(" Tm\n")) {
 		t.Fatal("embedded Thai must be placed with Tm so /W cannot collapse GPOS runs")
 	}
-	if contentContains(t, raw, []byte("BDC")) {
-		t.Fatal("ActualText/BDC around glyphs; Chrome restores the text matrix and collapses Thai")
-	}
-	if spans := actualTextSpans(t, raw); len(spans) != 0 {
-		t.Fatalf("unexpected ActualText spans %q", spans)
-	}
 	got := extractEmbeddedCIDText(t, raw)
 	if !strings.Contains(got, "วันที่") || !strings.Contains(got, "ผู้สอนเซ็นชื่อ") || !strings.Contains(got, "O-NET") {
 		t.Fatalf("missing labels in ToUnicode text: %q", got)
 	}
+}
+
+func TestThaiCombiningMarksUseLogicalActualText(t *testing.T) {
+	samples := []string{
+		"วันที่ผ่าน :",
+		"1. พื้นฐานสำหรับ ม.ปลาย",
+		"1. สมการพหุนามและเศษส่วนพหุนาม",
+	}
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(20)
+	y := 750.0
+	for _, s := range samples {
+		doc.Text(s, pdfkit.TextOptions{X: 72, Y: y, Width: 500})
+		y -= 28
+	}
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contentContains(t, raw, []byte(" Tm\n")) {
+		t.Fatal("glyphs must still be placed with Tm")
+	}
+	spans := actualTextSpans(t, raw)
+	joined := strings.Join(spans, "")
+	for _, s := range samples {
+		if !strings.Contains(joined, s) {
+			t.Fatalf("ActualText missing %q\n joined=%q\n spans=%q", s, joined, spans)
+		}
+		if containsAny(spans, s) {
+			t.Fatalf("ActualText wrapped the whole line %q; Chrome highlights only the first glyph", s)
+		}
+	}
+	// Logical cluster for ที่ is ท+ี+่, not visual ท+่+ี.
+	if !containsAny(spans, "ที่") {
+		t.Fatalf("expected ActualText cluster %q, got %q", "ที่", spans)
+	}
+	if containsAny(spans, "ท่ี") {
+		t.Fatalf("ActualText still uses visual mark order ท่ี: %q", spans)
+	}
+	if containsAny(spans, "ุ") {
+		t.Fatalf("sara u leaked as its own ActualText span (Chrome wraps it onto a new line): %q", spans)
+	}
+}
+
+func containsAny(spans []string, want string) bool {
+	for _, s := range spans {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 var (

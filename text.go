@@ -134,20 +134,68 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// Place every glyph with Tm at the shaped origin. Tj must not be what
-	// walks the cursor: CIDFont /W is required for Chrome Find/select
-	// highlight width, but honoring /W on Tj (and then Td-correcting) made
-	// Thai GPOS runs collapse in Chrome. Absolute Tm keeps v0.6 paint while
-	// /W still sizes the highlight. Do not wrap runs in ActualText BDC —
-	// Chrome restores the text matrix at EMC and stacks the glyphs.
+	// Place every glyph with Tm at the shaped origin so paint does not
+	// depend on CIDFont /W (v0.6 layout). Chrome Find/select still walks
+	// CIDs in stream order and maps combining marks in visual/glyph order
+	// (ที่ → ท่ี, ุ on its own line). Tag each OpenType cluster with
+	// ActualText of the source runes so copy/Find use logical Unicode.
+	// Tm is absolute, so EMC restoring the text matrix cannot collapse
+	// later glyphs the way incremental Td did in v0.8.
 	p.write("BT /%s %.5f Tf\n", fr.name, d.fontSize)
+	type placedGlyph struct {
+		g      shapedGlyph
+		px, py float64
+	}
+	placed := make([]placedGlyph, len(glyphs))
 	cx, cy := x, y
-	for _, g := range glyphs {
-		p.write("1 0 0 1 %.5f %.5f Tm\n", cx+g.XOffset, cy+g.YOffset)
-		p.write("<%04X> Tj\n", g.SubsetID)
+	for i, g := range glyphs {
+		placed[i] = placedGlyph{g: g, px: cx + g.XOffset, py: cy + g.YOffset}
 		cx += g.XAdvance
 	}
+	for i := 0; i < len(placed); {
+		j := i + 1
+		for j < len(placed) && placed[j].g.Cluster == placed[i].g.Cluster {
+			j++
+		}
+		src := clusterSource(line, glyphs, i, j)
+		if src != "" {
+			p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(src)))
+		}
+		for _, pl := range placed[i:j] {
+			p.write("1 0 0 1 %.5f %.5f Tm\n", pl.px, pl.py)
+			p.write("<%04X> Tj\n", pl.g.SubsetID)
+		}
+		if src != "" {
+			p.write("EMC\n")
+		}
+		i = j
+	}
 	p.write("ET\n")
+}
+
+func clusterSource(line string, glyphs []shapedGlyph, i, j int) string {
+	runes := []rune(line)
+	if i < 0 || i >= len(glyphs) {
+		return ""
+	}
+	start := glyphs[i].Cluster
+	if start < 0 {
+		start = 0
+	}
+	if start > len(runes) {
+		start = len(runes)
+	}
+	end := len(runes)
+	if j < len(glyphs) {
+		end = glyphs[j].Cluster
+	}
+	if end > len(runes) {
+		end = len(runes)
+	}
+	if end < start {
+		end = start
+	}
+	return string(runes[start:end])
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {
