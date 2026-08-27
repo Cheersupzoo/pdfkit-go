@@ -134,57 +134,31 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// One Tm for the line (v0.6-style Td afterwards). A Tm per cluster made
-	// Chrome treat each cluster as a new line, so Find/copy of วันที่ผ่าน
-	// became วั + newline + น + newline + ที่. ActualText still tags each
-	// OpenType cluster with logical source runes (ที่ not ท่ี). Td after
-	// EMC uses the cluster's shaped advance because Chrome restores the
-	// text matrix at EMC; paint inside the span already happened.
+	// One BT/Tm so PDFium treats the line as a single text object.
+	// v0.9's per-glyph Tm painted correctly but made Chrome walk glyphs
+	// in geometric order (ท่ี) and wrap marks such as ุ onto new lines.
+	// Per-cluster ActualText fixed the order, then Chrome inserted a
+	// newline at every BDC (วันที่ผ่าน → วั\nน\nที่). One ActualText for
+	// the whole line is the logical string; Td to each shaped origin
+	// keeps GPOS paint while CIDFont /W sizes the object bbox that
+	// Chrome distributes that ActualText across.
 	p.write("BT /%s %.5f Tf 1 0 0 1 %.5f %.5f Tm\n", fr.name, d.fontSize, x, y)
-	type placedGlyph struct {
-		g      shapedGlyph
-		px, py float64
+	useActualText := shapedLineHasCombiningCluster(glyphs)
+	if useActualText {
+		p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
 	}
-	placed := make([]placedGlyph, len(glyphs))
+	curX, curY := x, y
 	cx, cy := x, y
-	for i, g := range glyphs {
-		placed[i] = placedGlyph{g: g, px: cx + g.XOffset, py: cy + g.YOffset}
+	for _, g := range glyphs {
+		px, py := cx+g.XOffset, cy+g.YOffset
+		writeTd(p, px-curX, py-curY)
+		p.write("<%04X> Tj\n", g.SubsetID)
+		w := fr.glyphWidthPoints(g.OrigGID, d.fontSize)
+		curX, curY = px+w, py
 		cx += g.XAdvance
 	}
-	tmX, tmY := x, y
-	lineX, lineY := x, y
-	for i := 0; i < len(placed); {
-		j := i + 1
-		for j < len(placed) && placed[j].g.Cluster == placed[i].g.Cluster {
-			j++
-		}
-		src := clusterSource(line, glyphs, i, j)
-		writeTd(p, lineX-tmX, lineY-tmY)
-		tmX, tmY = lineX, lineY
-		if src != "" {
-			p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(src)))
-		}
-		curX, curY := tmX, tmY
-		for _, pl := range placed[i:j] {
-			writeTd(p, pl.px-curX, pl.py-curY)
-			p.write("<%04X> Tj\n", pl.g.SubsetID)
-			w := fr.glyphWidthPoints(pl.g.OrigGID, d.fontSize)
-			curX, curY = pl.px+w, pl.py
-		}
-		if src != "" {
-			p.write("EMC\n")
-			tmX, tmY = lineX, lineY
-		} else {
-			tmX, tmY = curX, curY
-		}
-		adv := 0.0
-		for _, g := range glyphs[i:j] {
-			adv += g.XAdvance
-		}
-		writeTd(p, adv, 0)
-		tmX += adv
-		lineX += adv
-		i = j
+	if useActualText {
+		p.write("EMC\n")
 	}
 	p.write("ET\n")
 }
@@ -196,29 +170,16 @@ func writeTd(p *Page, dx, dy float64) {
 	p.write("%.5f %.5f Td\n", dx, dy)
 }
 
-func clusterSource(line string, glyphs []shapedGlyph, i, j int) string {
-	runes := []rune(line)
-	if i < 0 || i >= len(glyphs) {
-		return ""
+// shapedLineHasCombiningCluster reports OpenType clusters that occupy more
+// than one glyph (Thai ที่, ำ, หุ, …). Those cannot round-trip through a
+// per-GID ToUnicode CMap, so drawSimpleLine tags the line with ActualText.
+func shapedLineHasCombiningCluster(glyphs []shapedGlyph) bool {
+	for i := 1; i < len(glyphs); i++ {
+		if glyphs[i].Cluster == glyphs[i-1].Cluster {
+			return true
+		}
 	}
-	start := glyphs[i].Cluster
-	if start < 0 {
-		start = 0
-	}
-	if start > len(runes) {
-		start = len(runes)
-	}
-	end := len(runes)
-	if j < len(glyphs) {
-		end = glyphs[j].Cluster
-	}
-	if end > len(runes) {
-		end = len(runes)
-	}
-	if end < start {
-		end = start
-	}
-	return string(runes[start:end])
+	return false
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {

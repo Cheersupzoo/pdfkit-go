@@ -59,13 +59,11 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	}
 	spans := actualTextSpans(t, raw)
 	joined := strings.Join(spans, "")
-	if !strings.Contains(joined, code) || !strings.Contains(joined, thai) {
-		t.Fatalf("ActualText missing source text:\n spans=%q\n joined=%q", spans, joined)
+	if !strings.Contains(joined, thai) {
+		t.Fatalf("ActualText missing Thai source:\n spans=%q\n joined=%q", spans, joined)
 	}
-	for _, s := range spans {
-		if s == "ชีท > "+thai || s == thai {
-			t.Fatalf("ActualText still wraps a whole line; Chrome will highlight only the first glyph: %q", s)
-		}
+	if !containsAny(spans, "ชีท > "+thai) && !containsAny(spans, thai) {
+		t.Fatalf("Thai combining line should be one ActualText span, got %q", spans)
 	}
 }
 
@@ -100,13 +98,8 @@ func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
 		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
 	}
 	spans := actualTextSpans(t, raw)
-	if strings.Join(spans, "") != label {
-		t.Fatalf("ActualText clusters = %q want %q", strings.Join(spans, ""), label)
-	}
-	for _, s := range spans {
-		if s == label {
-			t.Fatal("ActualText still wraps the whole line; Chrome will highlight only the first glyph")
-		}
+	if strings.Join(spans, "") != "" && strings.Join(spans, "") != label {
+		t.Fatalf("ActualText = %q want %q or empty (no combining cluster)", strings.Join(spans, ""), label)
 	}
 }
 
@@ -124,7 +117,10 @@ func TestEmbeddedThaiUsesAbsoluteTm(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !contentContains(t, raw, []byte(" Tm\n")) {
-		t.Fatal("embedded Thai must be placed with Tm so /W cannot collapse GPOS runs")
+		t.Fatal("embedded Thai must start the line with Tm")
+	}
+	if !contentContains(t, raw, []byte(" Td\n")) {
+		t.Fatal("GPOS placement must use Td after the line Tm")
 	}
 	got := extractEmbeddedCIDText(t, raw)
 	if !strings.Contains(got, "O-NET") {
@@ -158,23 +154,22 @@ func TestThaiCombiningMarksUseLogicalActualText(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !contentContains(t, raw, []byte(" Tm\n")) {
-		t.Fatal("glyphs must still be placed with Tm")
+		t.Fatal("line must still be placed with Tm")
 	}
 	spans := actualTextSpans(t, raw)
+	if len(spans) != len(samples) {
+		t.Fatalf("want one ActualText span per line, got %d: %q", len(spans), spans)
+	}
+	for i, s := range samples {
+		if spans[i] != s {
+			t.Fatalf("line %d ActualText:\n got %q\nwant %q\n all=%q", i, spans[i], s, spans)
+		}
+	}
 	joined := strings.Join(spans, "")
-	for _, s := range samples {
-		if !strings.Contains(joined, s) {
-			t.Fatalf("ActualText missing %q\n joined=%q\n spans=%q", s, joined, spans)
-		}
-		if containsAny(spans, s) {
-			t.Fatalf("ActualText wrapped the whole line %q; Chrome highlights only the first glyph", s)
-		}
+	if !strings.Contains(joined, "ที่") {
+		t.Fatalf("logical ที่ missing from ActualText: %q", spans)
 	}
-	// Logical cluster for ที่ is ท+ี+่, not visual ท+่+ี.
-	if !containsAny(spans, "ที่") {
-		t.Fatalf("expected ActualText cluster %q, got %q", "ที่", spans)
-	}
-	if containsAny(spans, "ท่ี") {
+	if strings.Contains(joined, "ท่ี") {
 		t.Fatalf("ActualText still uses visual mark order ท่ี: %q", spans)
 	}
 	if containsAny(spans, "ุ") {
@@ -183,6 +178,28 @@ func TestThaiCombiningMarksUseLogicalActualText(t *testing.T) {
 	got := extractEmbeddedCIDText(t, raw)
 	if strings.Contains(got, "ุ") {
 		t.Fatalf("sara u still in ToUnicode; Chrome copies it onto its own line: %q", got)
+	}
+}
+
+func TestASCIIEmbeddedLineHasNoActualText(t *testing.T) {
+	const want = "O-NET (50)"
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(20)
+	doc.Text(want, pdfkit.TextOptions{X: 72, Y: 750})
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spans := actualTextSpans(t, raw); len(spans) != 0 {
+		t.Fatalf("ASCII-only line should not use ActualText (keeps glyph highlight boxes): %q", spans)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if !strings.Contains(got, want) {
+		t.Fatalf("ASCII ToUnicode mismatch: got %q want %q", got, want)
 	}
 }
 
