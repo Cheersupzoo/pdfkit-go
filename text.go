@@ -134,69 +134,20 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// Chrome maps ActualText onto the first glyph of the marked span.
-	// One span for the whole line therefore highlights only the first
-	// character. Tag each shaping cluster so copy stays exact while
-	// CIDFont /W still sizes every glyph. Td is reserved for GPOS.
-	p.write("BT /%s %.5f Tf %.5f %.5f Td\n", fr.name, d.fontSize, x, y)
-	for i := 0; i < len(glyphs); {
-		j := i + 1
-		for j < len(glyphs) && glyphs[j].Cluster == glyphs[i].Cluster {
-			j++
-		}
-		src := clusterSource(line, glyphs, i, j)
-		if src != "" {
-			p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(src)))
-		}
-		for _, g := range glyphs[i:j] {
-			w := fr.glyphWidthPoints(g.OrigGID, d.fontSize)
-			if g.XOffset != 0 || g.YOffset != 0 {
-				writeTd(p, g.XOffset, g.YOffset)
-				p.write("<%04X> Tj\n", g.SubsetID)
-				writeTd(p, g.XAdvance-g.XOffset-w, -g.YOffset)
-				continue
-			}
-			p.write("<%04X> Tj\n", g.SubsetID)
-			writeTd(p, g.XAdvance-w, 0)
-		}
-		if src != "" {
-			p.write("EMC\n")
-		}
-		i = j
+	// Place every glyph with Tm at the shaped origin. Tj must not be what
+	// walks the cursor: CIDFont /W is required for Chrome Find/select
+	// highlight width, but honoring /W on Tj (and then Td-correcting) made
+	// Thai GPOS runs collapse in Chrome. Absolute Tm keeps v0.6 paint while
+	// /W still sizes the highlight. Do not wrap runs in ActualText BDC —
+	// Chrome restores the text matrix at EMC and stacks the glyphs.
+	p.write("BT /%s %.5f Tf\n", fr.name, d.fontSize)
+	cx, cy := x, y
+	for _, g := range glyphs {
+		p.write("1 0 0 1 %.5f %.5f Tm\n", cx+g.XOffset, cy+g.YOffset)
+		p.write("<%04X> Tj\n", g.SubsetID)
+		cx += g.XAdvance
 	}
 	p.write("ET\n")
-}
-
-func clusterSource(line string, glyphs []shapedGlyph, i, j int) string {
-	runes := []rune(line)
-	if i < 0 || i >= len(glyphs) {
-		return ""
-	}
-	start := glyphs[i].Cluster
-	if start < 0 {
-		start = 0
-	}
-	if start > len(runes) {
-		start = len(runes)
-	}
-	end := len(runes)
-	if j < len(glyphs) {
-		end = glyphs[j].Cluster
-	}
-	if end > len(runes) {
-		end = len(runes)
-	}
-	if end < start {
-		end = start
-	}
-	return string(runes[start:end])
-}
-
-func writeTd(p *Page, dx, dy float64) {
-	if dx > -1e-4 && dx < 1e-4 && dy > -1e-4 && dy < 1e-4 {
-		return
-	}
-	p.write("%.5f %.5f Td\n", dx, dy)
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {

@@ -197,17 +197,6 @@ func (fr *fontResource) advance(r rune, size float64) float64 {
 	return float64(fr.sfnt.GlyphAdvance(orig)) * size / upem
 }
 
-func (fr *fontResource) glyphWidthPoints(orig uint16, size float64) float64 {
-	if fr.standard || fr.sfnt == nil {
-		return 0
-	}
-	upem := float64(fr.sfnt.UnitsPerEm())
-	if upem == 0 {
-		upem = 1000
-	}
-	return float64(fr.sfnt.GlyphAdvance(orig)) * size / upem
-}
-
 func (fr *fontResource) cidWidthArray(glyphs []uint16) pdf.Array {
 	upem := float64(fr.sfnt.UnitsPerEm())
 	if upem == 0 {
@@ -326,9 +315,9 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 	}
 	descRef := cat.Add(descriptor)
 
-	// W is required for Chrome selection highlight width. DW=0 used to make
-	// every CID zero-width, so selecting a whole line only highlighted the
-	// first glyph. GPOS kerning/offsets still apply as Td corrections after Tj.
+	// W sizes Chrome Find/select highlights. DW=0 without W made every CID
+	// zero-width so a selection only highlighted the first glyph. Glyph
+	// paint does not use these widths: drawSimpleLine sets Tm per glyph.
 	cidFont := pdf.Dict{
 		"Type":           pdf.Name("Font"),
 		"Subtype":        pdf.Name("CIDFontType2"),
