@@ -134,13 +134,13 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// One Tm per OpenType cluster so Chrome treats base+marks as a single
-	// run on one line. Per-glyph Tm put marks at the next character's x
-	// (GPOS origin) and PDFium then copied ุ / ่ onto their own lines.
-	// ActualText is the source cluster (ที่ not ท่ี). Combining-mark CIDs
-	// have empty ToUnicode so they cannot leak into copy if ActualText is
-	// ignored. Paint still follows shaped positions via Td inside the cluster.
-	p.write("BT /%s %.5f Tf\n", fr.name, d.fontSize)
+	// One Tm for the line (v0.6-style Td afterwards). A Tm per cluster made
+	// Chrome treat each cluster as a new line, so Find/copy of วันที่ผ่าน
+	// became วั + newline + น + newline + ที่. ActualText still tags each
+	// OpenType cluster with logical source runes (ที่ not ท่ี). Td after
+	// EMC uses the cluster's shaped advance because Chrome restores the
+	// text matrix at EMC; paint inside the span already happened.
+	p.write("BT /%s %.5f Tf 1 0 0 1 %.5f %.5f Tm\n", fr.name, d.fontSize, x, y)
 	type placedGlyph struct {
 		g      shapedGlyph
 		px, py float64
@@ -151,17 +151,20 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		placed[i] = placedGlyph{g: g, px: cx + g.XOffset, py: cy + g.YOffset}
 		cx += g.XAdvance
 	}
+	tmX, tmY := x, y
+	lineX, lineY := x, y
 	for i := 0; i < len(placed); {
 		j := i + 1
 		for j < len(placed) && placed[j].g.Cluster == placed[i].g.Cluster {
 			j++
 		}
 		src := clusterSource(line, glyphs, i, j)
+		writeTd(p, lineX-tmX, lineY-tmY)
+		tmX, tmY = lineX, lineY
 		if src != "" {
 			p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(src)))
 		}
-		p.write("1 0 0 1 %.5f %.5f Tm\n", placed[i].px, placed[i].py)
-		curX, curY := placed[i].px, placed[i].py
+		curX, curY := tmX, tmY
 		for _, pl := range placed[i:j] {
 			writeTd(p, pl.px-curX, pl.py-curY)
 			p.write("<%04X> Tj\n", pl.g.SubsetID)
@@ -170,7 +173,17 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 		}
 		if src != "" {
 			p.write("EMC\n")
+			tmX, tmY = lineX, lineY
+		} else {
+			tmX, tmY = curX, curY
 		}
+		adv := 0.0
+		for _, g := range glyphs[i:j] {
+			adv += g.XAdvance
+		}
+		writeTd(p, adv, 0)
+		tmX += adv
+		lineX += adv
 		i = j
 	}
 	p.write("ET\n")
