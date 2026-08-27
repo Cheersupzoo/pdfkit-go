@@ -119,8 +119,8 @@ func TestEmbeddedThaiUsesAbsoluteTm(t *testing.T) {
 	if !contentContains(t, raw, []byte(" Tm\n")) {
 		t.Fatal("embedded Thai must start the line with Tm")
 	}
-	if !contentContains(t, raw, []byte(" Td\n")) {
-		t.Fatal("GPOS placement must use Td after the line Tm")
+	if !contentContains(t, raw, []byte("] TJ\n")) {
+		t.Fatal("GPOS placement must use one TJ so PDFium keeps a single text object")
 	}
 	got := extractEmbeddedCIDText(t, raw)
 	if !strings.Contains(got, "O-NET") {
@@ -155,6 +155,12 @@ func TestThaiCombiningMarksUseLogicalActualText(t *testing.T) {
 	}
 	if !contentContains(t, raw, []byte(" Tm\n")) {
 		t.Fatal("line must still be placed with Tm")
+	}
+	if !contentContains(t, raw, []byte("] TJ\n")) {
+		t.Fatal("combining Thai must be one TJ (one PDFium text object)")
+	}
+	if contentContains(t, raw, []byte(" Td\n")) {
+		t.Fatal("Td offsets from the line start and stacks Thai marks in the margin")
 	}
 	spans := actualTextSpans(t, raw)
 	if len(spans) != len(samples) {
@@ -213,9 +219,11 @@ func containsAny(spans []string, want string) bool {
 }
 
 var (
-	bfcharRe = regexp.MustCompile(`([0-9]+)\s+beginbfchar\s*((?:<[0-9A-Fa-f]+>\s*<(?:[0-9A-Fa-f]*)>\s*)+)endbfchar`)
-	pairRe   = regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>`)
-	tjCIDRe  = regexp.MustCompile(`<([0-9A-Fa-f]{4,})>\s*Tj`)
+	bfcharRe  = regexp.MustCompile(`([0-9]+)\s+beginbfchar\s*((?:<[0-9A-Fa-f]+>\s*<(?:[0-9A-Fa-f]*)>\s*)+)endbfchar`)
+	pairRe    = regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>`)
+	tjCIDRe   = regexp.MustCompile(`<([0-9A-Fa-f]{4,})>\s*Tj`)
+	tjArrayRe = regexp.MustCompile(`\[([^\]]*)\]\s*TJ`)
+	hexCIDRe  = regexp.MustCompile(`<([0-9A-Fa-f]{4,})>`)
 )
 
 func extractEmbeddedCIDText(t *testing.T, raw []byte) string {
@@ -264,18 +272,9 @@ func extractEmbeddedCIDText(t *testing.T, raw []byte) string {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, m := range tjCIDRe.FindAllSubmatch(decoded, -1) {
-				hexIDs := string(m[1])
-				if len(hexIDs)%4 != 0 {
-					t.Fatalf("odd CID hex length %q", hexIDs)
-				}
-				for i := 0; i < len(hexIDs); i += 4 {
-					cid64, err := strconv.ParseUint(hexIDs[i:i+4], 16, 16)
-					if err != nil {
-						t.Fatal(err)
-					}
-					b.WriteString(toUni[uint16(cid64)])
-				}
+			appendCIDText(&b, toUni, t, tjCIDRe.FindAllSubmatch(decoded, -1))
+			for _, m := range tjArrayRe.FindAllSubmatch(decoded, -1) {
+				appendCIDText(&b, toUni, t, hexCIDRe.FindAllSubmatch(m[1], -1))
 			}
 		}
 	}
@@ -287,6 +286,23 @@ func extractEmbeddedCIDText(t *testing.T, raw []byte) string {
 		t.Fatal("extracted empty text from CID operators")
 	}
 	return got
+}
+
+func appendCIDText(b *strings.Builder, toUni map[uint16]string, t *testing.T, matches [][][]byte) {
+	t.Helper()
+	for _, m := range matches {
+		hexIDs := string(m[1])
+		if len(hexIDs)%4 != 0 {
+			t.Fatalf("odd CID hex length %q", hexIDs)
+		}
+		for i := 0; i < len(hexIDs); i += 4 {
+			cid64, err := strconv.ParseUint(hexIDs[i:i+4], 16, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.WriteString(toUni[uint16(cid64)])
+		}
+	}
 }
 
 func contentStreams(model *pdf.DocumentModel, obj pdf.Object) []pdf.Stream {

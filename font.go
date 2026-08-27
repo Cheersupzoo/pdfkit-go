@@ -330,7 +330,7 @@ func (fr *fontResource) embedTrueType(cat *pdf.Catalog) (pdf.Ref, error) {
 
 	// W sizes Chrome Find/select highlights. DW=0 without W made every CID
 	// zero-width so a selection only highlighted the first glyph. Paint
-	// still Td-corrects to the shaped origin after each Tj honors /W.
+	// uses one TJ: /W advances plus kerning for GPOS x-offset residuals.
 	cidFont := pdf.Dict{
 		"Type":           pdf.Name("Font"),
 		"Subtype":        pdf.Name("CIDFontType2"),

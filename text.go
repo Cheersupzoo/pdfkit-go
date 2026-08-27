@@ -134,40 +134,64 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// One BT/Tm so PDFium treats the line as a single text object.
-	// v0.9's per-glyph Tm painted correctly but made Chrome walk glyphs
-	// in geometric order (ท่ี) and wrap marks such as ุ onto new lines.
-	// Per-cluster ActualText fixed the order, then Chrome inserted a
-	// newline at every BDC (วันที่ผ่าน → วั\nน\nที่). One ActualText for
-	// the whole line is the logical string; Td to each shaped origin
-	// keeps GPOS paint while CIDFont /W sizes the object bbox that
-	// Chrome distributes that ActualText across.
+	// One TJ so PDFium builds a single text object. Each Tj is its own
+	// object, so a per-cluster ActualText span (or a Td between glyphs)
+	// made Chrome copy ท่ี, wrap ุ onto a new line, and insert a newline
+	// at every BDC. Td is also wrong for GPOS: it offsets from the line
+	// start (Tlm), not the current point, which stacked marks in the
+	// margin. TJ kerning is relative to /W and keeps v0.9 paint. One
+	// ActualText for the line is the logical string; ASCII-only lines
+	// skip it so Find still uses real glyph boxes.
 	p.write("BT /%s %.5f Tf 1 0 0 1 %.5f %.5f Tm\n", fr.name, d.fontSize, x, y)
 	useActualText := shapedLineHasCombiningCluster(glyphs)
 	if useActualText {
 		p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
 	}
-	curX, curY := x, y
-	cx, cy := x, y
-	for _, g := range glyphs {
-		px, py := cx+g.XOffset, cy+g.YOffset
-		writeTd(p, px-curX, py-curY)
-		p.write("<%04X> Tj\n", g.SubsetID)
-		w := fr.glyphWidthPoints(g.OrigGID, d.fontSize)
-		curX, curY = px+w, py
-		cx += g.XAdvance
-	}
+	p.write("%s", shapedTJArray(fr, glyphs, d.fontSize))
 	if useActualText {
 		p.write("EMC\n")
 	}
 	p.write("ET\n")
 }
 
-func writeTd(p *Page, dx, dy float64) {
-	if dx > -1e-4 && dx < 1e-4 && dy > -1e-4 && dy < 1e-4 {
-		return
+// shapedTJArray positions OpenType glyphs with CIDFont /W plus TJ kerning
+// (thousandths of a text-space unit) equal to GPOS x-offset residuals.
+func shapedTJArray(fr *fontResource, glyphs []shapedGlyph, size float64) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	if len(glyphs) > 0 {
+		k0 := tjKerning(-glyphs[0].XOffset, size)
+		if k0 != 0 {
+			fmt.Fprintf(&b, "%.3f ", k0)
+		}
 	}
-	p.write("%.5f %.5f Td\n", dx, dy)
+	for i, g := range glyphs {
+		fmt.Fprintf(&b, "<%04X>", g.SubsetID)
+		if i+1 >= len(glyphs) {
+			continue
+		}
+		next := glyphs[i+1]
+		w := fr.glyphWidthPoints(g.OrigGID, size)
+		// After this glyph, PDF is at draw+W. Next draw is pen+XAdvance+next.XOffset.
+		delta := g.XAdvance + next.XOffset - g.XOffset - w
+		k := tjKerning(-delta, size)
+		if k != 0 {
+			fmt.Fprintf(&b, " %.3f ", k)
+		}
+	}
+	b.WriteString("] TJ\n")
+	return b.String()
+}
+
+func tjKerning(deltaPoints, size float64) float64 {
+	if size == 0 {
+		return 0
+	}
+	k := deltaPoints * 1000 / size
+	if k > -0.05 && k < 0.05 {
+		return 0
+	}
+	return k
 }
 
 // shapedLineHasCombiningCluster reports OpenType clusters that occupy more
