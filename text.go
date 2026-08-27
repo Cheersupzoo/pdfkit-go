@@ -134,20 +134,76 @@ func (d *Document) drawSimpleLine(p *Page, fr *fontResource, line string, x, y f
 	if len(glyphs) == 0 {
 		return
 	}
-	// Place every glyph with Tm at the shaped origin. Tj must not be what
-	// walks the cursor: CIDFont /W is required for Chrome Find/select
-	// highlight width, but honoring /W on Tj (and then Td-correcting) made
-	// Thai GPOS runs collapse in Chrome. Absolute Tm keeps v0.6 paint while
-	// /W still sizes the highlight. Do not wrap runs in ActualText BDC —
-	// Chrome restores the text matrix at EMC and stacks the glyphs.
-	p.write("BT /%s %.5f Tf\n", fr.name, d.fontSize)
-	cx, cy := x, y
-	for _, g := range glyphs {
-		p.write("1 0 0 1 %.5f %.5f Tm\n", cx+g.XOffset, cy+g.YOffset)
-		p.write("<%04X> Tj\n", g.SubsetID)
-		cx += g.XAdvance
+	// One TJ so PDFium builds a single text object. Each Tj is its own
+	// object, so a per-cluster ActualText span (or a Td between glyphs)
+	// made Chrome copy ท่ี, wrap ุ onto a new line, and insert a newline
+	// at every BDC. Td is also wrong for GPOS: it offsets from the line
+	// start (Tlm), not the current point, which stacked marks in the
+	// margin. TJ kerning is relative to /W and keeps v0.9 paint. One
+	// ActualText for the line is the logical string; ASCII-only lines
+	// skip it so Find still uses real glyph boxes.
+	p.write("BT /%s %.5f Tf 1 0 0 1 %.5f %.5f Tm\n", fr.name, d.fontSize, x, y)
+	useActualText := shapedLineHasCombiningCluster(glyphs)
+	if useActualText {
+		p.write("/Span << /ActualText <%s> >> BDC\n", "FEFF"+encodeUTF16BEHex([]rune(line)))
+	}
+	p.write("%s", shapedTJArray(fr, glyphs, d.fontSize))
+	if useActualText {
+		p.write("EMC\n")
 	}
 	p.write("ET\n")
+}
+
+// shapedTJArray positions OpenType glyphs with CIDFont /W plus TJ kerning
+// (thousandths of a text-space unit) equal to GPOS x-offset residuals.
+func shapedTJArray(fr *fontResource, glyphs []shapedGlyph, size float64) string {
+	var b strings.Builder
+	b.WriteByte('[')
+	if len(glyphs) > 0 {
+		k0 := tjKerning(-glyphs[0].XOffset, size)
+		if k0 != 0 {
+			fmt.Fprintf(&b, "%.3f ", k0)
+		}
+	}
+	for i, g := range glyphs {
+		fmt.Fprintf(&b, "<%04X>", g.SubsetID)
+		if i+1 >= len(glyphs) {
+			continue
+		}
+		next := glyphs[i+1]
+		w := fr.glyphWidthPoints(g.OrigGID, size)
+		// After this glyph, PDF is at draw+W. Next draw is pen+XAdvance+next.XOffset.
+		delta := g.XAdvance + next.XOffset - g.XOffset - w
+		k := tjKerning(-delta, size)
+		if k != 0 {
+			fmt.Fprintf(&b, " %.3f ", k)
+		}
+	}
+	b.WriteString("] TJ\n")
+	return b.String()
+}
+
+func tjKerning(deltaPoints, size float64) float64 {
+	if size == 0 {
+		return 0
+	}
+	k := deltaPoints * 1000 / size
+	if k > -0.05 && k < 0.05 {
+		return 0
+	}
+	return k
+}
+
+// shapedLineHasCombiningCluster reports OpenType clusters that occupy more
+// than one glyph (Thai ที่, ำ, หุ, …). Those cannot round-trip through a
+// per-GID ToUnicode CMap, so drawSimpleLine tags the line with ActualText.
+func shapedLineHasCombiningCluster(glyphs []shapedGlyph) bool {
+	for i := 1; i < len(glyphs); i++ {
+		if glyphs[i].Cluster == glyphs[i-1].Cluster {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Document) drawJustifiedLine(p *Page, fr *fontResource, line string, x, y, maxW float64) {

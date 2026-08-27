@@ -54,14 +54,16 @@ func TestEmbeddedFontCopyPasteThaiAndCode(t *testing.T) {
 	if !strings.Contains(got, code) {
 		t.Fatalf("code copy-paste mismatch:\n got %q\nwant substring %q", got, code)
 	}
-	if !strings.Contains(got, thai) {
-		t.Fatalf("Thai copy-paste mismatch:\n got %q\nwant substring %q", got, thai)
-	}
 	if strings.Contains(got, `!"#"$%#$&'#(#`) {
 		t.Fatalf("got the old Identity-H garbage mapping: %q", got)
 	}
-	if spans := actualTextSpans(t, raw); len(spans) != 0 {
-		t.Fatalf("ActualText BDC collapses Thai in Chrome; got spans %q", spans)
+	spans := actualTextSpans(t, raw)
+	joined := strings.Join(spans, "")
+	if !strings.Contains(joined, thai) {
+		t.Fatalf("ActualText missing Thai source:\n spans=%q\n joined=%q", spans, joined)
+	}
+	if !containsAny(spans, "ชีท > "+thai) && !containsAny(spans, thai) {
+		t.Fatalf("Thai combining line should be one ActualText span, got %q", spans)
 	}
 }
 
@@ -95,8 +97,9 @@ func TestCIDFontWidthsMatchRenderedAdvance(t *testing.T) {
 	if !strings.Contains(got, label) {
 		t.Fatalf("copy-paste mismatch: got %q want %q", got, label)
 	}
-	if spans := actualTextSpans(t, raw); len(spans) != 0 {
-		t.Fatalf("ActualText BDC collapses Thai in Chrome; got spans %q", spans)
+	spans := actualTextSpans(t, raw)
+	if strings.Join(spans, "") != "" && strings.Join(spans, "") != label {
+		t.Fatalf("ActualText = %q want %q or empty (no combining cluster)", strings.Join(spans, ""), label)
 	}
 }
 
@@ -114,24 +117,113 @@ func TestEmbeddedThaiUsesAbsoluteTm(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !contentContains(t, raw, []byte(" Tm\n")) {
-		t.Fatal("embedded Thai must be placed with Tm so /W cannot collapse GPOS runs")
+		t.Fatal("embedded Thai must start the line with Tm")
 	}
-	if contentContains(t, raw, []byte("BDC")) {
-		t.Fatal("ActualText/BDC around glyphs; Chrome restores the text matrix and collapses Thai")
-	}
-	if spans := actualTextSpans(t, raw); len(spans) != 0 {
-		t.Fatalf("unexpected ActualText spans %q", spans)
+	if !contentContains(t, raw, []byte("] TJ\n")) {
+		t.Fatal("GPOS placement must use one TJ so PDFium keeps a single text object")
 	}
 	got := extractEmbeddedCIDText(t, raw)
-	if !strings.Contains(got, "วันที่") || !strings.Contains(got, "ผู้สอนเซ็นชื่อ") || !strings.Contains(got, "O-NET") {
-		t.Fatalf("missing labels in ToUnicode text: %q", got)
+	if !strings.Contains(got, "O-NET") {
+		t.Fatalf("missing ASCII in ToUnicode text: %q", got)
+	}
+	joined := strings.Join(actualTextSpans(t, raw), "")
+	if !strings.Contains(joined, "วันที่") || !strings.Contains(joined, "ผู้สอนเซ็นชื่อ") || !strings.Contains(joined, "O-NET") {
+		t.Fatalf("missing labels in ActualText: %q", joined)
 	}
 }
 
+func TestThaiCombiningMarksUseLogicalActualText(t *testing.T) {
+	samples := []string{
+		"วันที่ผ่าน :",
+		"1. พื้นฐานสำหรับ ม.ปลาย",
+		"1. สมการพหุนามและเศษส่วนพหุนาม",
+	}
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(20)
+	y := 750.0
+	for _, s := range samples {
+		doc.Text(s, pdfkit.TextOptions{X: 72, Y: y, Width: 500})
+		y -= 28
+	}
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contentContains(t, raw, []byte(" Tm\n")) {
+		t.Fatal("line must still be placed with Tm")
+	}
+	if !contentContains(t, raw, []byte("] TJ\n")) {
+		t.Fatal("combining Thai must be one TJ (one PDFium text object)")
+	}
+	if contentContains(t, raw, []byte(" Td\n")) {
+		t.Fatal("Td offsets from the line start and stacks Thai marks in the margin")
+	}
+	spans := actualTextSpans(t, raw)
+	if len(spans) != len(samples) {
+		t.Fatalf("want one ActualText span per line, got %d: %q", len(spans), spans)
+	}
+	for i, s := range samples {
+		if spans[i] != s {
+			t.Fatalf("line %d ActualText:\n got %q\nwant %q\n all=%q", i, spans[i], s, spans)
+		}
+	}
+	joined := strings.Join(spans, "")
+	if !strings.Contains(joined, "ที่") {
+		t.Fatalf("logical ที่ missing from ActualText: %q", spans)
+	}
+	if strings.Contains(joined, "ท่ี") {
+		t.Fatalf("ActualText still uses visual mark order ท่ี: %q", spans)
+	}
+	if containsAny(spans, "ุ") {
+		t.Fatalf("sara u leaked as its own ActualText span (Chrome wraps it onto a new line): %q", spans)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if strings.Contains(got, "ุ") {
+		t.Fatalf("sara u still in ToUnicode; Chrome copies it onto its own line: %q", got)
+	}
+}
+
+func TestASCIIEmbeddedLineHasNoActualText(t *testing.T) {
+	const want = "O-NET (50)"
+	doc := pdfkit.New(pdfkit.WithPageSize(pdfkit.A4))
+	if err := doc.RegisterFontFile("THSarabun", "testdata/fonts/THSarabun-Regular.ttf", 0); err != nil {
+		t.Fatal(err)
+	}
+	doc.AddPage()
+	doc.Font("THSarabun").FontSize(20)
+	doc.Text(want, pdfkit.TextOptions{X: 72, Y: 750})
+	raw, err := doc.Bytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spans := actualTextSpans(t, raw); len(spans) != 0 {
+		t.Fatalf("ASCII-only line should not use ActualText (keeps glyph highlight boxes): %q", spans)
+	}
+	got := extractEmbeddedCIDText(t, raw)
+	if !strings.Contains(got, want) {
+		t.Fatalf("ASCII ToUnicode mismatch: got %q want %q", got, want)
+	}
+}
+
+func containsAny(spans []string, want string) bool {
+	for _, s := range spans {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
 var (
-	bfcharRe = regexp.MustCompile(`([0-9]+)\s+beginbfchar\s*((?:<[0-9A-Fa-f]+>\s*<(?:[0-9A-Fa-f]*)>\s*)+)endbfchar`)
-	pairRe   = regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>`)
-	tjCIDRe  = regexp.MustCompile(`<([0-9A-Fa-f]{4,})>\s*Tj`)
+	bfcharRe  = regexp.MustCompile(`([0-9]+)\s+beginbfchar\s*((?:<[0-9A-Fa-f]+>\s*<(?:[0-9A-Fa-f]*)>\s*)+)endbfchar`)
+	pairRe    = regexp.MustCompile(`<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>`)
+	tjCIDRe   = regexp.MustCompile(`<([0-9A-Fa-f]{4,})>\s*Tj`)
+	tjArrayRe = regexp.MustCompile(`\[([^\]]*)\]\s*TJ`)
+	hexCIDRe  = regexp.MustCompile(`<([0-9A-Fa-f]{4,})>`)
 )
 
 func extractEmbeddedCIDText(t *testing.T, raw []byte) string {
@@ -180,18 +272,9 @@ func extractEmbeddedCIDText(t *testing.T, raw []byte) string {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, m := range tjCIDRe.FindAllSubmatch(decoded, -1) {
-				hexIDs := string(m[1])
-				if len(hexIDs)%4 != 0 {
-					t.Fatalf("odd CID hex length %q", hexIDs)
-				}
-				for i := 0; i < len(hexIDs); i += 4 {
-					cid64, err := strconv.ParseUint(hexIDs[i:i+4], 16, 16)
-					if err != nil {
-						t.Fatal(err)
-					}
-					b.WriteString(toUni[uint16(cid64)])
-				}
+			appendCIDText(&b, toUni, t, tjCIDRe.FindAllSubmatch(decoded, -1))
+			for _, m := range tjArrayRe.FindAllSubmatch(decoded, -1) {
+				appendCIDText(&b, toUni, t, hexCIDRe.FindAllSubmatch(m[1], -1))
 			}
 		}
 	}
@@ -203,6 +286,23 @@ func extractEmbeddedCIDText(t *testing.T, raw []byte) string {
 		t.Fatal("extracted empty text from CID operators")
 	}
 	return got
+}
+
+func appendCIDText(b *strings.Builder, toUni map[uint16]string, t *testing.T, matches [][][]byte) {
+	t.Helper()
+	for _, m := range matches {
+		hexIDs := string(m[1])
+		if len(hexIDs)%4 != 0 {
+			t.Fatalf("odd CID hex length %q", hexIDs)
+		}
+		for i := 0; i < len(hexIDs); i += 4 {
+			cid64, err := strconv.ParseUint(hexIDs[i:i+4], 16, 16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.WriteString(toUni[uint16(cid64)])
+		}
+	}
 }
 
 func contentStreams(model *pdf.DocumentModel, obj pdf.Object) []pdf.Stream {
